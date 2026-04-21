@@ -1,0 +1,43 @@
+{
+  "name": "local-notebook-llm",
+  "version": "0.1.0",
+  "description": "Local, vectorless document intelligence powered by structural RAG and llama.cpp",
+  "dependencies": [
+    {
+      "name": "sqlite3",
+      "features": [
+        "fts5"
+      ]
+    },
+    {
+      "name": "pugixml"
+    },
+    {
+      "name": "minizip"
+    },
+    {
+      "name": "gtest"
+    },
+    {
+      "name": "nlohmann-json"
+    },
+    {
+      "name": "stb"
+    },
+    {
+      "name": "libmupdf"
+    },
+    {
+      "name": "imgui",
+      "features": [
+        "dx11-binding",
+        "win32-binding",
+        "freetype"
+      ]
+    },
+    {
+      "name": "freetype"
+    }
+  ],
+  "builtin-baseline": "77df67cfff9c12ccfdb52284e07c87c75092f723"
+}

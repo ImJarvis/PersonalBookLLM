@@ -1,0 +1,26 @@
+# Build output
+build/
+out/
+cmake-build-*/
+
+# Models (large binary files)
+models/*.gguf
+
+# Runtime data
+data/*.db
+data/*.sqlite
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+*.sln.docstates
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# vcpkg installed
+vcpkg_installed/

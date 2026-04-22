@@ -2,10 +2,15 @@
 #include <algorithm>
 #include <sstream>
 #include <cctype>
+#include <regex>
 
 namespace LocalNotebookLLM::Application {
 
     const std::vector<std::string>& QueryAnalyzer::GetStopwords() {
+        // ⚠️  IMPORTANT: Only strip *grammatical* function words here.
+        // DO NOT include content-bearing words like "summary", "chapter", "about",
+        // "explain", "overview" — those words carry the user's intent and must
+        // survive into the search query.
         static const std::vector<std::string> stopwords = {
             "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
             "have", "has", "had", "do", "does", "did", "will", "would", "could",
@@ -19,12 +24,63 @@ namespace LocalNotebookLLM::Application {
             "very", "just", "because", "but", "and", "or", "if", "while",
             "these", "those", "am", "it", "its", "i", "me", "my", "we", "our",
             "you", "your", "he", "him", "his", "she", "her", "they", "them", "their",
-            // Meta-words users commonly ask about the document itself
-            "doc", "document", "file", "text", "page", "pages", "pdf", "docx",
-            "summary", "summarize", "explain", "tell", "show", "give", "provide",
-            "about", "contains", "contents", "content"
+            // Truly empty referential words
+            "this", "that", "get", "give", "tell", "show",
         };
         return stopwords;
+    }
+
+    QueryIntent QueryAnalyzer::DetectIntent(const std::string& query) {
+        // Lowercase the query for pattern matching
+        std::string lower = query;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+
+        // ─── Chapter/Section summary patterns ───
+        // e.g. "summary of chapter 1", "summarize chapter 3", "what is in chapter 2",
+        //      "explain section 4", "overview of part 2"
+        static const std::regex chapterPattern(
+            R"((chapter|section|part|ch\.?)\s*(\d+|[ivxlcdm]+|one|two|three|four|five|six|seven|eight|nine|ten))",
+            std::regex::icase);
+        if (std::regex_search(lower, chapterPattern)) {
+            return QueryIntent::ChapterSummary;
+        }
+
+        // ─── Full-document summation patterns ───
+        // e.g. "what is this about", "summarize this document", "give me an overview",
+        //      "what does this pdf contain", "explain this document"
+        static const std::vector<std::string> summationPhrases = {
+            "what is this",
+            "what is the document",
+            "what is this pdf",
+            "what is this book",
+            "what is this about",
+            "what does this",
+            "what does the document",
+            "summarize",
+            "summarise",
+            "summary",
+            "overview",
+            "main topic",
+            "main topics",
+            "about this",
+            "about the document",
+            "explain this",
+            "key points",
+            "key ideas",
+            "main points",
+            "what are the topics",
+            "what topics",
+            "table of contents",
+            "contents of",
+        };
+        for (const auto& phrase : summationPhrases) {
+            if (lower.find(phrase) != std::string::npos) {
+                return QueryIntent::Summation;
+            }
+        }
+
+        return QueryIntent::Keyword;
     }
 
     std::vector<std::string> QueryAnalyzer::ExtractKeywords(const std::string& query) {
@@ -65,8 +121,6 @@ namespace LocalNotebookLLM::Application {
         std::string query;
         for (size_t i = 0; i < keywords.size(); ++i) {
             if (i > 0) query += " OR ";
-
-            // Quote terms that might contain special FTS5 characters
             query += "\"" + keywords[i] + "\"";
         }
         return query;
@@ -78,3 +132,4 @@ namespace LocalNotebookLLM::Application {
     }
 
 } // namespace LocalNotebookLLM::Application
+

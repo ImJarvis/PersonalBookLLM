@@ -40,6 +40,9 @@ namespace LocalNotebookLLM::UI {
         bool ingesting = false;
         std::string ingestionStatus;
         float ingestionProgress = 0.0f;
+        // Persists after ingestion completes so the user can see the error even
+        // when the ingestion status bar has been hidden. Cleared on next successful ingest.
+        std::string lastIngestionError;
 
         // ─── Chat ───
         std::deque<ChatMessage> chatHistory;

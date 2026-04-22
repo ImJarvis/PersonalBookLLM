@@ -200,15 +200,47 @@ namespace LocalNotebookLLM::Application {
 
     std::string InferenceService::BuildPrompt(const Core::AssembledContext& ctx,
                                                const std::string& query) {
+        // Detect intent so we can tailor the instruction to the model
+        auto intent = Application::QueryAnalyzer::DetectIntent(query);
+
         std::ostringstream oss;
-        oss << "You are a precise document analysis assistant. "
-            << "Answer questions using ONLY the provided document context. "
-            << "Always cite your sources using [Page X] notation. "
-            << "If the context does not contain enough information, say so.\n\n"
-            << ctx.formattedContext
-            << "=== QUESTION ===\n"
-            << query << "\n\n"
-            << "=== ANSWER ===\n";
+
+        if (intent == Application::QueryIntent::Summation) {
+            // For broad overview queries: instruct the model to synthesize a summary
+            oss << "You are a helpful document assistant. "
+                << "Based on the document content provided below, give a clear and concise summary. "
+                << "Cover the main topics, key arguments, and structure of the document. "
+                << "Use [Page X] notation when citing specific passages.\n\n"
+                << ctx.formattedContext
+                << "=== QUESTION ===\n"
+                << query << "\n\n"
+                << "=== ANSWER ===\n"
+                << "This document is about ";  // Primes the model to answer directly
+        }
+        else if (intent == Application::QueryIntent::ChapterSummary) {
+            // For chapter-specific queries: summarize the specific section
+            oss << "You are a helpful document assistant. "
+                << "Based on the chapter or section content provided below, give a focused summary "
+                << "of what that chapter covers: its main ideas, arguments, and conclusions. "
+                << "Use [Page X] notation when citing specific passages.\n\n"
+                << ctx.formattedContext
+                << "=== QUESTION ===\n"
+                << query << "\n\n"
+                << "=== ANSWER ===\n"
+                << "This chapter covers ";  // Primes the model to answer directly
+        }
+        else {
+            // For specific keyword/fact queries: precise retrieval mode
+            oss << "You are a precise document analysis assistant. "
+                << "Answer the question using the document passages provided below. "
+                << "Be direct and specific. Cite sources with [Page X] notation. "
+                << "If the information is genuinely not in the provided passages, say so briefly.\n\n"
+                << ctx.formattedContext
+                << "=== QUESTION ===\n"
+                << query << "\n\n"
+                << "=== ANSWER ===\n";
+        }
+
         return oss.str();
     }
 

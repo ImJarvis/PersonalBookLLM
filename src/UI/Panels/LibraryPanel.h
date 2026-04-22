@@ -53,7 +53,7 @@ namespace LocalNotebookLLM::UI {
                 ImGui::Spacing();
             }
 
-            // ─── Ingestion status bar ───
+            // ─── Ingestion status bar (active progress) ───
             if (state.ingesting) {
                 ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.05f, 0.15f, 0.05f, 0.8f));
                 ImGui::BeginChild("IngestionBar", ImVec2(0, 50), ImGuiChildFlags_Borders);
@@ -62,6 +62,38 @@ namespace LocalNotebookLLM::UI {
                                    state.ingestionStatus.c_str());
                 ImGui::EndChild();
                 ImGui::PopStyleColor();
+                ImGui::Spacing();
+            }
+
+            // ─── Persistent error banner (shown even after ingesting=false) ───
+            if (!state.lastIngestionError.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.22f, 0.06f, 0.06f, 0.95f));
+                ImGui::PushStyleColor(ImGuiCol_Border,   ImVec4(0.80f, 0.20f, 0.20f, 1.0f));
+                ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.5f);
+                ImGui::BeginChild("IngestionErrorBar", ImVec2(0, 52), ImGuiChildFlags_Borders);
+                {
+                    ImGui::Spacing();
+                    ImGui::SetCursorPosX(8);
+                    ImGui::TextColored(ImVec4(1.0f, 0.40f, 0.40f, 1.0f), "  Could not load document:");
+                    ImGui::SameLine();
+                    // Dismiss button, right-aligned
+                    float dismissX = ImGui::GetContentRegionAvail().x - 60;
+                    if (dismissX > 0) ImGui::SetCursorPosX(dismissX + ImGui::GetCursorPosX() - ImGui::GetContentRegionAvail().x + dismissX);
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.4f, 0.1f, 0.1f, 0.8f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.6f, 0.15f, 0.15f, 1.0f));
+                    if (ImGui::SmallButton("Dismiss")) {
+                        state.lastIngestionError.clear();
+                    }
+                    ImGui::PopStyleColor(2);
+                    ImGui::SetCursorPosX(8);
+                    // Truncate long error messages for display
+                    std::string displayErr = state.lastIngestionError;
+                    if (displayErr.size() > 120) displayErr = displayErr.substr(0, 117) + "...";
+                    ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.75f, 1.0f), "  %s", displayErr.c_str());
+                }
+                ImGui::EndChild();
+                ImGui::PopStyleVar();
+                ImGui::PopStyleColor(2);
                 ImGui::Spacing();
             }
 

@@ -28,6 +28,17 @@ namespace LocalNotebookLLM::Infrastructure {
         std::shared_ptr<Core::IEmbeddingProvider>  m_embeddingProvider;
         std::shared_ptr<DatabaseManager>           m_db;
 
+        /// Fetch the document's structural skeleton for summation queries:
+        /// title + all headings + first paragraph under each heading.
+        [[nodiscard]]
+        std::vector<Core::HybridSearchResult>
+        GetDocumentOverview(int64_t documentIdFilter, int topK) const;
+
+        /// Fetch all content nodes under the heading that matches a chapter/section reference.
+        [[nodiscard]]
+        std::vector<Core::HybridSearchResult>
+        GetChapterContent(const std::string& query, int64_t documentIdFilter, int topK) const;
+
         /// Convert base SearchResults to HybridSearchResults with tier annotation.
         [[nodiscard]]
         static std::vector<Core::HybridSearchResult>
@@ -47,3 +58,4 @@ namespace LocalNotebookLLM::Infrastructure {
     };
 
 } // namespace LocalNotebookLLM::Infrastructure
+

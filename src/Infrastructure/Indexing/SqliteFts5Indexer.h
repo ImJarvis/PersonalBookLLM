@@ -37,9 +37,12 @@ namespace LocalNotebookLLM::Infrastructure {
         std::shared_ptr<Core::IEmbeddingProvider> m_embedder;
 
         /// Recursively walk the document tree, inserting nodes into the DB.
+        /// @param insertStmt A pre-prepared INSERT statement — reused for every node
+        ///        to avoid re-compiling the SQL on each recursive call.
         void WalkAndInsert(int64_t docId, const Core::DocumentNode& node,
                            std::optional<int64_t> parentDbId,
-                           std::string& sectionPath, int& sortOrder);
+                           std::string& sectionPath, int& sortOrder,
+                           SqliteStatement& insertStmt);
 
         /// Escape user query for safe FTS5 MATCH usage.
         static std::string EscapeFts5Query(const std::string& query);

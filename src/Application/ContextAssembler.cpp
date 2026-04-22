@@ -14,8 +14,11 @@ namespace LocalNotebookLLM::Application {
 
     std::string ContextAssembler::FormatSourceBlock(const Core::SearchResult& result) {
         std::ostringstream oss;
-        oss << "[SOURCE: Page " << result.pageNumber << "]\n"
-            << result.content << "\n\n";
+        oss << "[Page " << result.pageNumber << "]";
+        if (!result.sectionPath.empty() && result.sectionPath != "Document Root") {
+            oss << " — " << result.sectionPath;
+        }
+        oss << "\n" << result.content << "\n\n";
         return oss.str();
     }
 
@@ -31,12 +34,11 @@ namespace LocalNotebookLLM::Application {
         size_t usedTokens = 0;
 
         std::ostringstream contextStream;
-        contextStream << "=== DOCUMENT CONTEXT ===\n"
-                      << "You are an analytical retrieval assistant. Your sole purpose is to retrieve facts.\n"
-                      << "1. Use ONLY the following sources to answer the question.\n"
-                      << "2. If the sources below DO NOT contain the exact answer, you MUST reply: \"The provided document does not contain this information.\"\n"
-                      << "3. DO NOT use your own knowledge. DO NOT hallucinate.\n"
-                      << "4. Cite sources meticulously using exact [Page X] notation.\n\n";
+        contextStream
+            << "=== DOCUMENT CONTENT ===\n"
+            << "The following passages are extracted from the document in reading order.\n"
+            << "Use them to answer the question accurately and helpfully.\n"
+            << "Cite page numbers using [Page X] notation when referencing specific content.\n\n";
 
         usedTokens += m_estimator(contextStream.str());
 

@@ -18,15 +18,27 @@ namespace LocalNotebookLLM::Infrastructure {
             std::string sectionPath;
             int sortOrder = 0;
 
+            // ─── PERF FIX: Prepare the INSERT once, reuse it for every node ───
+            // Previously this was called inside WalkAndInsert (recursive), which
+            // meant sqlite3_prepare_v2 was called once per node — O(N) compilations.
+            // Now we compile once and Reset()+Rebind() per node — O(1) compilations.
+            auto insertStmt = m_db->Prepare(R"(
+                INSERT INTO document_nodes
+                    (document_id, parent_id, node_type, page_number, section_path,
+                     content, font_size, is_bold, bbox_x, bbox_y, bbox_w, bbox_h,
+                     confidence, sort_order, embedding)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            )");
+
             const auto& root = tree.GetRoot();
 
             // If root is a Document node, walk its children directly
             if (root.GetType() == Core::NodeType::Document) {
                 for (const auto& child : root.GetChildren()) {
-                    WalkAndInsert(documentId, child, std::nullopt, sectionPath, sortOrder);
+                    WalkAndInsert(documentId, child, std::nullopt, sectionPath, sortOrder, insertStmt);
                 }
             } else {
-                WalkAndInsert(documentId, root, std::nullopt, sectionPath, sortOrder);
+                WalkAndInsert(documentId, root, std::nullopt, sectionPath, sortOrder, insertStmt);
             }
 
             // Update node count in documents table
@@ -49,12 +61,13 @@ namespace LocalNotebookLLM::Infrastructure {
     void SqliteFts5Indexer::WalkAndInsert(
         int64_t docId, const Core::DocumentNode& node,
         std::optional<int64_t> parentDbId,
-        std::string& sectionPath, int& sortOrder)
+        std::string& sectionPath, int& sortOrder,
+        SqliteStatement& stmt)  // pre-prepared INSERT, passed by reference — not re-compiled per node
     {
         // Skip empty content nodes
         if (node.GetText().empty() && !node.IsHeading()) {
             for (const auto& child : node.GetChildren()) {
-                WalkAndInsert(docId, child, parentDbId, sectionPath, sortOrder);
+                WalkAndInsert(docId, child, parentDbId, sectionPath, sortOrder, stmt);
             }
             return;
         }
@@ -70,15 +83,9 @@ namespace LocalNotebookLLM::Infrastructure {
 
         std::string currentPath = sectionPath.empty() ? "Document Root" : sectionPath;
 
-        // Insert into document_nodes (FTS5 trigger auto-inserts into fts_index)
-        auto stmt = m_db->Prepare(R"(
-            INSERT INTO document_nodes
-                (document_id, parent_id, node_type, page_number, section_path,
-                 content, font_size, is_bold, bbox_x, bbox_y, bbox_w, bbox_h,
-                 confidence, sort_order, embedding)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        )");
-
+        // Reset the shared prepared statement and bind fresh values for this node.
+        // This is the key perf fix: Reset() is O(1), vs Prepare() which is O(SQL length).
+        stmt.Reset();
         stmt.Bind(1, docId);
         stmt.Bind(2, parentDbId);
         stmt.Bind(3, Core::NodeTypeToString(node.GetType()));
@@ -95,14 +102,14 @@ namespace LocalNotebookLLM::Infrastructure {
         stmt.Bind(12, std::optional<double>(bbox.h));
         stmt.Bind(13, std::optional<double>(node.GetConfidence()));
         stmt.Bind(14, sortOrder++);
-
         stmt.BindNull(15);
         stmt.Execute();
+
         int64_t nodeDbId = m_db->LastInsertRowId();
 
         // Recurse into children
         for (const auto& child : node.GetChildren()) {
-            WalkAndInsert(docId, child, nodeDbId, sectionPath, sortOrder);
+            WalkAndInsert(docId, child, nodeDbId, sectionPath, sortOrder, stmt);
         }
 
         // Restore section path when leaving a heading scope

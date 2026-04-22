@@ -272,9 +272,11 @@ namespace LocalNotebookLLM::UI {
         }
 
         LOG_INFO("App", "IngestDocument() begin: " + filePath.string());
-        m_state.ingesting = true;
+        m_state.ingesting         = true;
         m_state.ingestionProgress = 0.0f;
-        m_state.ingestionStatus = "Starting ingestion...";
+        m_state.ingestionStatus   = "Starting ingestion...";
+        m_state.lastIngestionError = "";  // Clear previous error so banner doesn't show during new ingestion
+
 
         m_ingestionFuture = std::async(std::launch::async, [this, filePath]() {
             try {
@@ -288,24 +290,31 @@ namespace LocalNotebookLLM::UI {
 
                 std::lock_guard lock(m_stateMutex);
                 if (result) {
-                    m_state.ingestionStatus = "Done: " + result->filename +
+                    m_state.ingestionStatus   = "Done: " + result->filename +
                         " (" + std::to_string(result->pageCount) + " pages)";
+                    m_state.lastIngestionError = "";  // Clear any previous error on success
                 } else {
-                    m_state.ingestionStatus = "Error: " + result.error();
+                    // Store error persistently so the UI shows it even after ingesting=false
+                    m_state.ingestionStatus    = "Failed";
+                    m_state.lastIngestionError = result.error();
+                    LOG_ERROR("App", "[async] Ingestion FAILED: " + result.error());
                 }
             } catch (const std::exception& e) {
                 std::lock_guard lock(m_stateMutex);
-                m_state.ingestionStatus = "Exception: " + std::string(e.what());
+                m_state.ingestionStatus    = "Exception";
+                m_state.lastIngestionError = std::string(e.what());
                 LOG_ERROR("App", "[async] Exception in Ingestion: " + std::string(e.what()));
             } catch (...) {
                 std::lock_guard lock(m_stateMutex);
-                m_state.ingestionStatus = "Unknown fatal error occurred during ingestion.";
+                m_state.ingestionStatus    = "Unknown error";
+                m_state.lastIngestionError = "An unknown fatal error occurred during ingestion.";
             }
             
             std::lock_guard finalLock(m_stateMutex);
             m_state.ingesting = false;
             RefreshDocumentList();
         });
+
     }
 
     void App::RemoveDocument(int64_t docId) {

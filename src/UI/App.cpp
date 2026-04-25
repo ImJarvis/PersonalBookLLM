@@ -5,6 +5,7 @@
 #include "Infrastructure/Parsing/CompositeParser.h"
 #include "Infrastructure/Parsing/DocxParser.h"
 #include "Infrastructure/Parsing/PdfParser.h"
+#include "Infrastructure/Parsing/PdfVlmParser.h"
 #include "Infrastructure/Search/HybridSearchEngine.h"
 #include "Infrastructure/Search/StructuralNavigator.h"
 #include "Infrastructure/LLM/LlamaCppProvider.h"
@@ -35,7 +36,35 @@ namespace LocalNotebookLLM::UI {
     }
 
     App::~App() {
-        LOG_DEBUG("App", "App destructor called");
+        LOG_DEBUG("App", "App destructor — cancelling in-flight operations");
+
+        // Cancel any running generation so the thread exits promptly
+        if (m_reasonerLLM)  m_reasonerLLM->GetCancellationToken().Cancel();
+        if (m_workerLLM)    m_workerLLM->GetCancellationToken().Cancel();
+
+        // Join all futures with a timeout to prevent infinite hang on exit
+        auto joinFuture = [](std::future<void>& f, const char* name) {
+            if (f.valid()) {
+                auto status = f.wait_for(std::chrono::seconds(5));
+                if (status == std::future_status::ready) {
+                    try { f.get(); } catch (...) {}
+                } else {
+                    LOG_WARN("App", std::string("~App: ") + name + " did not finish in 5s — detaching");
+                }
+            }
+        };
+        joinFuture(m_generationFuture, "generation");
+        joinFuture(m_ingestionFuture, "ingestion");
+        joinFuture(m_reasonerLoadFuture, "reasonerLoad");
+        joinFuture(m_workerLoadFuture, "workerLoad");
+
+        // Join abandoned futures
+        for (auto& f : m_abandonedFutures) {
+            joinFuture(f, "abandoned");
+        }
+        m_abandonedFutures.clear();
+
+        LOG_DEBUG("App", "App destructor — all threads joined, destroying resources");
     }
 
     bool App::Initialize(const std::filesystem::path& dataDir) {
@@ -69,11 +98,11 @@ namespace LocalNotebookLLM::UI {
         auto repo    = std::make_shared<Infrastructure::SqliteDocumentRepository>(m_db);
         LOG_INFO("App", "Indexer + Repository created");
 
-        // Parser (CompositeParser with DOCX + PDF support)
+        // Parser (CompositeParser with DOCX + PDF VLM support)
         auto composite = std::make_unique<Infrastructure::CompositeParser>();
         composite->RegisterParser(std::make_unique<Infrastructure::DocxParser>());
-        composite->RegisterParser(std::make_unique<Infrastructure::PdfParser>());
-        LOG_INFO("App", "CompositeParser created (DOCX + PDF support)");
+        composite->RegisterParser(std::make_unique<Infrastructure::PdfVlmParser>());
+        LOG_INFO("App", "CompositeParser created (DOCX + PDF VLM support)");
 
         // ─── Dual LLM Providers ───
         m_workerLLM   = std::make_shared<Infrastructure::LlamaCppProvider>();
@@ -108,10 +137,10 @@ namespace LocalNotebookLLM::UI {
             Infrastructure::MemoryOrchestrator::ModelConfig reasonerCfg;
             reasonerCfg.modelPath       = reasonerPath;
             reasonerCfg.estimatedSizeMB = 2560;  // ~2.5 GB for Gemma 4B Q4
-            reasonerCfg.params.contextWindowSize = 4096;
-            reasonerCfg.params.temperature = 0.0f; // Force deterministic, strict grounding
+            reasonerCfg.params.contextWindowSize = 8192; // Doubled: more passages in context, longer answers
+            reasonerCfg.params.temperature = 0.3f; // 0.3 for explanatory synthesis (0.0 causes robotic output)
             m_memoryOrch->SetReasonerConfig(reasonerCfg);
-            LOG_INFO("App", "Reasoner config set: 4096 ctx, 0.3 temp, ~2560 MB");
+            LOG_INFO("App", "Reasoner config set: 8192 ctx, 0.3 temp, ~2560 MB");
         }
 
         // ─── DocumentService (uses Worker via MemoryOrchestrator for enrichment) ───
@@ -191,8 +220,21 @@ namespace LocalNotebookLLM::UI {
             LOG_WARN("App", "No worker model found in: " + m_modelsDir.string());
         }
 
-        // ─── Reasoner Model (Gemma) ───
+        // ─── Reasoner Model ───
+        // Priority order: Phi-4-mini first (best quality/size on doc Q&A),
+        // then Gemma-3 family (good synthesis), then legacy E2B.
         const std::vector<std::string> reasonerCandidates = {
+            // Phi-4-mini — recommended (MIT license, ~2.5 GB, best local doc Q&A)
+            "Phi-4-mini-instruct-Q4_K_M.gguf",
+            "Phi-4-mini-instruct-Q4_K_S.gguf",
+            "Phi-4-mini-instruct-Q8_0.gguf",
+            "phi-4-mini-instruct-Q4_K_M.gguf",
+            // Gemma-3-12B — high quality, needs ≥8 GB VRAM
+            "gemma-3-12b-it-Q4_K_M.gguf",
+            "gemma-3-12b-it-Q4_K_S.gguf",
+            // Gemma-3-4B — lighter multimodal version
+            "gemma-3-4b-it-Q4_K_M.gguf",
+            // Legacy / previously configured
             "gemma-4-e2b-it-Q4_K_M.gguf",
             LOCALNOTEBOOK_REASONER_MODEL,
         };
@@ -208,14 +250,21 @@ namespace LocalNotebookLLM::UI {
             }
         }
 
-        // Fallback: scan all .gguf files
+        // Fallback: scan all .gguf files for any known reasoner
         if (reasonerPath.empty()) {
             LOG_INFO("App", "  No default reasoner — scanning all .gguf files...");
             auto models = ScanAvailableModels();
             for (const auto& m : models) {
-                if (m.find("gemma") != std::string::npos ||
-                    m.find("e2b") != std::string::npos ||
-                    m.find("e4b") != std::string::npos) {
+                std::string lower = m;
+                for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+                if (lower.find("phi-4") != std::string::npos ||
+                    lower.find("phi4")  != std::string::npos ||
+                    lower.find("gemma-3-12") != std::string::npos ||
+                    lower.find("gemma-3-4") != std::string::npos ||
+                    lower.find("gemma") != std::string::npos ||
+                    lower.find("e2b")   != std::string::npos ||
+                    lower.find("e4b")   != std::string::npos) {
                     reasonerPath = m_modelsDir / m;
                     LOG_INFO("App", "  Reasoner fallback found: " + m);
                     break;
@@ -234,10 +283,18 @@ namespace LocalNotebookLLM::UI {
         }
 
         // ─── Embed Model ───
+        // Priority: nomic-embed-text-v1.5 (768-dim, 8pt better MTEB than BGE-micro)
+        // then legacy bge-micro as fallback.
         const std::vector<std::string> embedCandidates = {
+            // nomic-embed-text-v1.5 — recommended (Apache 2.0, ~274 MB, 768-dim)
+            "nomic-embed-text-v1.5.f16.gguf",
+            "nomic-embed-text-v1.5.Q8_0.gguf",
+            "nomic-embed-text-v1.5.Q4_K_M.gguf",
+            // nomic v2 MoE — newer, multilingual
+            "nomic-embed-text-v2-moe.f16.gguf",
+            // Legacy candidates
             LOCALNOTEBOOK_EMBEDDING_MODEL,
             "bge-micro-v2.gguf",
-            "nomic-embed-text-v1.5.Q8_0.gguf"
         };
         
         std::filesystem::path embedPath;
@@ -336,6 +393,9 @@ namespace LocalNotebookLLM::UI {
         m_state.generating = true;
         m_state.generationStatus = "Searching documents...";
         m_state.streamingAnswer.clear();
+        m_state.lastActivityTime = std::chrono::steady_clock::now();
+        m_state.generationStartTime = m_state.lastActivityTime;
+        m_state.elapsedGenerationSec = 0.0;
 
         m_generationFuture = std::async(std::launch::async, [this, query]() {
             try {
@@ -344,9 +404,11 @@ namespace LocalNotebookLLM::UI {
                     [this](const std::string& token) {
                         std::lock_guard lock(m_stateMutex);
                         m_state.streamingAnswer += token;
+                        m_state.lastActivityTime = std::chrono::steady_clock::now();
                     },
                     [this](const Application::AnswerProgress& p) {
                         std::lock_guard lock(m_stateMutex);
+                        m_state.lastActivityTime = std::chrono::steady_clock::now();
                         switch (p.stage) {
                             case Application::AnswerProgress::Stage::Searching: m_state.generationStatus = "Searching documents..."; break;
                             case Application::AnswerProgress::Stage::Assembling: m_state.generationStatus = "Assembling context..."; break;
@@ -360,7 +422,17 @@ namespace LocalNotebookLLM::UI {
                 if (result) {
                     m_state.chatHistory.push_back({ ChatMessage::Role::Assistant, result->answerText, result->citations, result->generationTimeMs, result->sectionsSearched });
                 } else {
-                    m_state.chatHistory.push_back({ ChatMessage::Role::System, "Error: " + result.error(), {}, 0, 0 });
+                    // Distinguish user-initiated cancellation from real errors
+                    const auto& err = result.error();
+                    bool wasCancelled = (err.find("cancelled") != std::string::npos ||
+                                         err.find("Cancelled") != std::string::npos);
+                    if (wasCancelled) {
+                        m_state.chatHistory.push_back({ ChatMessage::Role::System, "Operation cancelled.", {}, 0, 0 });
+                        LOG_INFO("App", "[async] Generation cancelled by user/watchdog");
+                    } else {
+                        m_state.chatHistory.push_back({ ChatMessage::Role::System, "Error: " + err, {}, 0, 0 });
+                        LOG_ERROR("App", "[async] Generation error: " + err);
+                    }
                 }
             } catch (const std::exception& e) {
                 std::lock_guard lock(m_stateMutex);
@@ -381,8 +453,21 @@ namespace LocalNotebookLLM::UI {
         m_reasonerLoadFuture = std::async(std::launch::async, [this, modelPath]() {
             LOG_INFO("App", "[async] Reasoner load thread started: " + modelPath.filename().string());
             Core::ModelParams params;
-            params.contextWindowSize = 4096;
+            params.contextWindowSize = 8192; // Matches Initialize() reasoner config
             params.temperature = 0.3f;
+            
+            // Workaround for llama.cpp bug with Phi models: ggml_reshape_2d aborts
+            // when using Flash Attention with quantized KV cache (Q8_0).
+            // We MUST keep Flash Attention enabled for speed, but use F16 KV cache to prevent the crash.
+            std::string lowerPath = modelPath.filename().string();
+            for (auto& c : lowerPath) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (lowerPath.find("phi") != std::string::npos) {
+                params.useFlashAttention = true; // explicitly enable for speed
+                params.kvCacheTypeK = Core::ModelParams::KVCacheType::F16;
+                params.kvCacheTypeV = Core::ModelParams::KVCacheType::F16;
+                LOG_INFO("App", "Detected Phi model — set KV cache to F16 to prevent crashes, keeping Flash Attention enabled for speed.");
+            }
+
             auto result = m_reasonerLLM->LoadModel(modelPath, params);
 
             std::lock_guard lock(m_stateMutex);
@@ -408,6 +493,19 @@ namespace LocalNotebookLLM::UI {
             Core::ModelParams params;
             params.contextWindowSize = 2048;
             params.temperature = 0.1f;
+            
+            // Workaround for llama.cpp bug with Phi models: ggml_reshape_2d aborts
+            // when using Flash Attention with quantized KV cache (Q8_0).
+            // We MUST keep Flash Attention enabled for speed, but use F16 KV cache to prevent the crash.
+            std::string lowerPath = modelPath.filename().string();
+            for (auto& c : lowerPath) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (lowerPath.find("phi") != std::string::npos) {
+                params.useFlashAttention = true; // explicitly enable for speed
+                params.kvCacheTypeK = Core::ModelParams::KVCacheType::F16;
+                params.kvCacheTypeV = Core::ModelParams::KVCacheType::F16;
+                LOG_INFO("App", "Detected Phi model — set KV cache to F16 to prevent crashes, keeping Flash Attention enabled for speed.");
+            }
+
             auto result = m_workerLLM->LoadModel(modelPath, params);
 
             std::lock_guard lock(m_stateMutex);
@@ -435,6 +533,104 @@ namespace LocalNotebookLLM::UI {
         check(m_generationFuture);
         check(m_reasonerLoadFuture);
         check(m_workerLoadFuture);
+
+        // ─── Clean up finished abandoned futures (prevent memory leaks) ───
+        m_abandonedFutures.erase(
+            std::remove_if(m_abandonedFutures.begin(), m_abandonedFutures.end(),
+                [](std::future<void>& f) {
+                    if (!f.valid()) return true;
+                    if (f.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+                        try { f.get(); } catch (...) {}  // Swallow — thread is done
+                        return true;
+                    }
+                    return false;
+                }),
+            m_abandonedFutures.end());
+
+        // ─── Generation Elapsed Time + Heartbeat Monitoring ───
+        if (m_state.generating) {
+            auto now = std::chrono::steady_clock::now();
+
+            // Update elapsed time for UI display every frame
+            m_state.elapsedGenerationSec =
+                std::chrono::duration<double>(now - m_state.generationStartTime).count();
+
+            // Read eval progress from the provider (lock-free atomics)
+            auto& token = m_reasonerLLM->GetCancellationToken();
+            int evalDone  = token.evalTokensDone.load(std::memory_order_acquire);
+            int evalTotal = token.evalTokensTotal.load(std::memory_order_acquire);
+
+            // If prompt evaluation is in progress, show detailed progress in UI
+            if (evalTotal > 0 && evalDone < evalTotal) {
+                int pct = static_cast<int>(100.0 * evalDone / evalTotal);
+                std::lock_guard lock(m_stateMutex);
+                m_state.generationStatus = "Evaluating context... " +
+                    std::to_string(evalDone) + "/" + std::to_string(evalTotal) +
+                    " tokens (" + std::to_string(pct) + "%)";
+            }
+
+            // Heartbeat watchdog: only if heartbeat hasn't updated in 10 MINUTES
+            // On CPU, a single batch decode of 128 tokens on a 4B model can take
+            // 30-60 seconds. We need to be very generous here.
+            // 10 minutes with zero heartbeat = thread is truly dead, not just slow.
+            int64_t heartbeatMs = token.GetHeartbeatMs();
+            if (heartbeatMs > 0) {
+                auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now.time_since_epoch()).count();
+                auto silentMs = nowMs - heartbeatMs;
+
+                if (silentMs > 600'000) {  // 10 minutes — thread is truly dead
+                    LOG_ERROR("App", "Heartbeat watchdog: inference thread unresponsive for >10 min. "
+                        "Thread is likely crashed. Abandoning and recovering.");
+
+                    // Nuclear option: abandon the stuck thread and rebuild
+                    {
+                        std::lock_guard lock(m_stateMutex);
+                        m_state.generating = false;
+                        m_state.streamingAnswer.clear();
+                        m_state.chatHistory.push_back({
+                            ChatMessage::Role::System,
+                            "Error: The inference engine stopped responding. "
+                            "The system has recovered automatically — please try again.",
+                            {}, 0, 0
+                        });
+                    }
+
+                    if (m_generationFuture.valid()) {
+                        m_abandonedFutures.push_back(std::move(m_generationFuture));
+                    }
+
+                    m_reasonerLLM = std::make_shared<Infrastructure::LlamaCppProvider>();
+                    m_inferService->UpdateLLMProvider(m_reasonerLLM);
+
+                    if (!m_state.reasonerPath.empty()) {
+                        LoadReasonerModel(m_state.reasonerPath);
+                    }
+                }
+            }
+        }
+    }
+
+    void App::CancelGeneration() {
+        if (!m_state.generating) return;
+
+        LOG_INFO("App", "CancelGeneration() — signalling cancellation token");
+
+        // Signal the LLM provider to stop at the next safe checkpoint.
+        // The generation thread will see this and return cleanly.
+        m_reasonerLLM->GetCancellationToken().Cancel();
+
+        // Update UI state immediately so the user gets feedback
+        {
+            std::lock_guard lock(m_stateMutex);
+            m_state.generationStatus = "Cancelling...";
+        }
+
+        // NOTE: We do NOT set generating=false here.  The async thread will
+        // do that when it finishes (which should be within a few hundred ms
+        // now that the cancellation flag is set).  If the thread truly hangs
+        // past the next watchdog cycle (another 90s), we escalate to the
+        // nuclear option: abandon the future and rebuild the provider.
     }
 
     std::vector<std::string> App::ScanAvailableModels() const {
@@ -451,14 +647,28 @@ namespace LocalNotebookLLM::UI {
         }
         LOG_INFO("App", "ScanAvailableModels: found " + std::to_string(models.size()) + " .gguf files");
 
-        // Sort: put reasoner first, worker second, then alphabetical
+        // Sort: put best reasoner models first, then embedders, then alphabetical
         std::sort(models.begin(), models.end(), [](const std::string& a, const std::string& b) {
-            auto isReasoner = [](const std::string& s) {
-                return s.find("gemma") != std::string::npos ||
-                       s.find("e2b") != std::string::npos ||
-                       s.find("e4b") != std::string::npos;
+            // Returns a priority score: lower = show first
+            auto priority = [](const std::string& s) -> int {
+                std::string lower = s;
+                for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                // Phi-4-mini: best doc Q&A model
+                if (lower.find("phi-4") != std::string::npos ||lower.find("phi4") != std::string::npos) return 0;
+                // Gemma-3-12B: high quality
+                if (lower.find("gemma-3-12") != std::string::npos) return 1;
+                // Gemma-3-4B
+                if (lower.find("gemma-3-4") != std::string::npos) return 2;
+                // Legacy Gemma reasoner
+                if (lower.find("gemma") != std::string::npos || lower.find("e2b") != std::string::npos) return 3;
+                // Qwen (worker class)
+                if (lower.find("qwen") != std::string::npos) return 5;
+                // Embedders last
+                if (lower.find("embed") != std::string::npos || lower.find("bge") != std::string::npos) return 8;
+                return 6;
             };
-            if (isReasoner(a) != isReasoner(b)) return isReasoner(a);
+            int pa = priority(a), pb = priority(b);
+            if (pa != pb) return pa < pb;
             return a < b;
         });
 

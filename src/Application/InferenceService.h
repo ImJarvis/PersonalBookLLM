@@ -50,6 +50,8 @@ namespace LocalNotebookLLM::Application {
         std::expected<void, std::string>
         LoadModel(const std::filesystem::path& modelPath, const Core::ModelParams& params = {});
 
+        void UpdateLLMProvider(std::shared_ptr<Core::ILLMProvider> newProvider);
+
         [[nodiscard]] Core::ModelStatus GetModelStatus() const;
         [[nodiscard]] bool IsReady() const;
 

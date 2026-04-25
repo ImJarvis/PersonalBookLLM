@@ -1,5 +1,6 @@
 #include "Application/ContextAssembler.h"
 #include "Core/Enums/NodeType.h"
+#include <algorithm>
 #include <sstream>
 
 namespace LocalNotebookLLM::Application {
@@ -33,16 +34,25 @@ namespace LocalNotebookLLM::Application {
         size_t contextBudget = static_cast<size_t>(maxTokens * 0.80);
         size_t usedTokens = 0;
 
+        // ── Sort into reading order so the LLM sees a coherent document narrative ──
+        // Score-ranked order fragments the document; reading order lets the model
+        // follow the author's argument from beginning to end.
+        std::vector<Core::SearchResult> ordered(results);
+        std::sort(ordered.begin(), ordered.end(),
+            [](const Core::SearchResult& a, const Core::SearchResult& b) {
+                if (a.documentId != b.documentId) return a.documentId < b.documentId;
+                return a.pageNumber < b.pageNumber;
+            });
+
         std::ostringstream contextStream;
         contextStream
             << "=== DOCUMENT CONTENT ===\n"
             << "The following passages are extracted from the document in reading order.\n"
-            << "Use them to answer the question accurately and helpfully.\n"
-            << "Cite page numbers using [Page X] notation when referencing specific content.\n\n";
+            << "Read them carefully and use them to answer the question.\n\n";
 
         usedTokens += m_estimator(contextStream.str());
 
-        for (const auto& result : results) {
+        for (const auto& result : ordered) {
             std::string block = FormatSourceBlock(result);
             size_t blockTokens = m_estimator(block);
 

@@ -19,7 +19,7 @@ namespace LocalNotebookLLM::Core {
 
         [[nodiscard]]
         virtual std::expected<std::vector<float>, std::string>
-        Embed(const std::string& text) = 0;
+        Embed(const std::string& text, bool isQuery = false) = 0;
 
         [[nodiscard]]
         virtual std::expected<std::vector<std::vector<float>>, std::string>

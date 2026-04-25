@@ -32,6 +32,13 @@ namespace LocalNotebookLLM::Application {
     InferenceService::InferenceService(InferenceService&&) noexcept = default;
     InferenceService& InferenceService::operator=(InferenceService&&) noexcept = default;
 
+    void InferenceService::UpdateLLMProvider(std::shared_ptr<Core::ILLMProvider> newProvider) {
+        if (newProvider) {
+            m_impl->llm = std::move(newProvider);
+            LOG_INFO("Inference", "LLM Provider updated successfully");
+        }
+    }
+
     std::expected<Core::CitedAnswer, std::string>
     InferenceService::AskQuestion(const std::string& query, AnswerProgressCallback progress) {
         LOG_INFO("Inference", "AskQuestion() query: \"" + query + "\"");
@@ -118,7 +125,12 @@ namespace LocalNotebookLLM::Application {
 
         if (progress) progress({AnswerProgress::Stage::Generating, ""});
         std::string prompt = BuildPrompt(ctx, query);
-        auto genResult = m_impl->llm->GenerateStreaming(prompt, 1024, tokenCallback);
+
+        // Use a larger generation budget for broad synthesis queries
+        auto intent = Application::QueryAnalyzer::DetectIntent(query);
+        int maxGenTokens = (intent == Application::QueryIntent::Summation ||
+                            intent == Application::QueryIntent::ChapterSummary) ? 2048 : 1024;
+        auto genResult = m_impl->llm->GenerateStreaming(prompt, maxGenTokens, tokenCallback);
 
         if (!genResult) {
             return std::unexpected("Generation failed: " + genResult.error().message);
@@ -200,41 +212,57 @@ namespace LocalNotebookLLM::Application {
 
     std::string InferenceService::BuildPrompt(const Core::AssembledContext& ctx,
                                                const std::string& query) {
-        // Detect intent so we can tailor the instruction to the model
         auto intent = Application::QueryAnalyzer::DetectIntent(query);
 
         std::ostringstream oss;
 
         if (intent == Application::QueryIntent::Summation) {
-            // For broad overview queries: instruct the model to synthesize a summary
-            oss << "You are a helpful document assistant. "
-                << "Based on the document content provided below, give a clear and concise summary. "
-                << "Cover the main topics, key arguments, and structure of the document. "
-                << "Use [Page X] notation when citing specific passages.\n\n"
+            // Synthesis prompt: demands reasoning and explanation, forbids copy-paste.
+            // Key design decisions:
+            //   1. Explicitly forbid verbatim copying — small models default to extraction.
+            //   2. Ask for step-by-step synthesis before giving the answer.
+            //   3. No completion primer — let the model decide how to open its response.
+            oss << "You are an expert document analyst. "
+                << "Your task is to read the document passages below and produce an intelligent, "
+                << "well-structured explanation of the document's content.\n\n"
+                << "RULES:\n"
+                << "- Do NOT copy or paraphrase sentences from the source text verbatim.\n"
+                << "- Synthesize information across multiple passages into a coherent explanation.\n"
+                << "- Identify the main theme, key arguments, and the overall conclusion.\n"
+                << "- Write in clear, natural prose as if explaining to an intelligent reader.\n"
+                << "- You may note page numbers parenthetically (e.g. 'on page 12') but do not let "
+                << "citations interrupt the flow of explanation.\n\n"
                 << ctx.formattedContext
                 << "=== QUESTION ===\n"
                 << query << "\n\n"
-                << "=== ANSWER ===\n"
-                << "This document is about ";  // Primes the model to answer directly
+                << "=== YOUR ANALYSIS ===\n"
+                << "Step 1 — Main theme: ";
         }
         else if (intent == Application::QueryIntent::ChapterSummary) {
-            // For chapter-specific queries: summarize the specific section
-            oss << "You are a helpful document assistant. "
-                << "Based on the chapter or section content provided below, give a focused summary "
-                << "of what that chapter covers: its main ideas, arguments, and conclusions. "
-                << "Use [Page X] notation when citing specific passages.\n\n"
+            // Chapter synthesis: focused explanation of a specific section.
+            oss << "You are an expert document analyst. "
+                << "Read the chapter passages provided below and produce an intelligent summary "
+                << "of what this chapter is about.\n\n"
+                << "RULES:\n"
+                << "- Do NOT reproduce passages verbatim.\n"
+                << "- Explain the chapter's central argument, supporting ideas, and conclusions.\n"
+                << "- Write as if explaining the chapter to someone who has not read it.\n"
+                << "- Keep the response structured: briefly state what the chapter is about, "
+                << "then explain its key points, then state what the reader will take away.\n\n"
                 << ctx.formattedContext
                 << "=== QUESTION ===\n"
                 << query << "\n\n"
-                << "=== ANSWER ===\n"
-                << "This chapter covers ";  // Primes the model to answer directly
+                << "=== YOUR EXPLANATION ===\n";
         }
         else {
-            // For specific keyword/fact queries: precise retrieval mode
-            oss << "You are a precise document analysis assistant. "
-                << "Answer the question using the document passages provided below. "
-                << "Be direct and specific. Cite sources with [Page X] notation. "
-                << "If the information is genuinely not in the provided passages, say so briefly.\n\n"
+            // Specific fact/concept query: precision mode with synthesis over simple retrieval.
+            oss << "You are a precise and thoughtful document assistant. "
+                << "Use the document passages below to answer the question directly and clearly.\n\n"
+                << "RULES:\n"
+                << "- Answer in your own words — do not quote the source text verbatim.\n"
+                << "- Be specific and concrete. Avoid vague hedging."
+                << "- If the answer requires connecting ideas from multiple passages, do so explicitly.\n"
+                << "- If the information is not present in the provided passages, say so clearly.\n\n"
                 << ctx.formattedContext
                 << "=== QUESTION ===\n"
                 << query << "\n\n"

@@ -2,6 +2,7 @@
 #include "Infrastructure/LLM/GPUDetector.h"
 #include "Core/Log.h"
 #include <chrono>
+#include <functional>
 #include <thread>
 
 // ─── Conditionally include llama.cpp headers ───
@@ -36,20 +37,34 @@ namespace LocalNotebookLLM::Infrastructure {
 
     struct LlamaCppProvider::Impl {
 #ifdef HAS_LLAMA_CPP
-        llama_model*   model   = nullptr;
-        llama_context* ctx     = nullptr;
-        const llama_vocab* vocab = nullptr;
+        llama_model*       model   = nullptr;
+        llama_context*     ctx     = nullptr;
+        const llama_vocab* vocab   = nullptr;
+        llama_sampler*     sampler = nullptr; // Cached sampler — rebuilt only when params change
 #endif
         Core::ModelParams params;
         Core::ModelStatus status;
         bool loaded = false;
+
+        // ── KV cache prefix tracking ──
+        // We split every prompt into a stable "prefix" (system prompt + document context)
+        // and a variable "tail" (the user's question). If the prefix hasn't changed since
+        // the last call, the KV cache already holds it and we can skip re-evaluation.
+        size_t lastPromptHash    = 0;   // std::hash of the full prompt string
+        int    lastPrefixTokens  = 0;   // how many tokens were in the cached prefix
+        bool   kvCacheWarm       = false;
     };
+
+    // Global flag to ensure llama_backend_init is only called exactly once
+    static std::once_flag g_llamaInitFlag;
 
     LlamaCppProvider::LlamaCppProvider()
         : m_impl(std::make_unique<Impl>()) {
 #ifdef HAS_LLAMA_CPP
-        llama_backend_init();
-        LOG_INFO("LlamaCpp", "Backend initialized (HAS_LLAMA_CPP=1)");
+        std::call_once(g_llamaInitFlag, []() {
+            llama_backend_init();
+            LOG_INFO("LlamaCpp", "Backend initialized natively (once globally)");
+        });
 #else
         LOG_WARN("LlamaCpp", "Compiled WITHOUT llama.cpp (HAS_LLAMA_CPP not defined)");
 #endif
@@ -59,8 +74,9 @@ namespace LocalNotebookLLM::Infrastructure {
         LOG_DEBUG("LlamaCpp", "Destructor — unloading model");
         UnloadModel();
 #ifdef HAS_LLAMA_CPP
-        llama_backend_free();
-        LOG_DEBUG("LlamaCpp", "Backend freed");
+        // DO NOT call llama_backend_free() here.
+        // It's global state shared by Worker, Reasoner, and Embedder.
+        // Calling free here crashes the other active models.
 #endif
     }
 
@@ -132,6 +148,8 @@ namespace LocalNotebookLLM::Infrastructure {
         // ─── Context parameters ───
         auto cparams = llama_context_default_params();
         cparams.n_ctx     = params.contextWindowSize;
+        cparams.n_batch   = 128;  // Smaller batches = more frequent cancellation checkpoints
+                                   // (default 512 can block for 30+s per chunk on CPU)
         cparams.n_threads = params.threadCount > 0
                            ? params.threadCount
                            : static_cast<int>(std::thread::hardware_concurrency());
@@ -175,6 +193,23 @@ namespace LocalNotebookLLM::Infrastructure {
         m_impl->status.gpuLayers     = gpuLayers;
         m_impl->status.device        = gpuLayers > 0 ? "GPU" : "CPU";
 
+        // Reset KV cache tracking on new model load
+        m_impl->lastPromptHash   = 0;
+        m_impl->lastPrefixTokens = 0;
+        m_impl->kvCacheWarm      = false;
+
+        // Rebuild cached sampler for the new model/params
+        if (m_impl->sampler) {
+            llama_sampler_free(m_impl->sampler);
+            m_impl->sampler = nullptr;
+        }
+        m_impl->sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(m_impl->sampler, llama_sampler_init_top_k(params.topK));
+        llama_sampler_chain_add(m_impl->sampler, llama_sampler_init_top_p(params.topP, 1));
+        llama_sampler_chain_add(m_impl->sampler, llama_sampler_init_temp(params.temperature));
+        llama_sampler_chain_add(m_impl->sampler, llama_sampler_init_dist(0));
+        LOG_INFO("LlamaCpp", "Sampler chain built and cached");
+
         LOG_INFO("LlamaCpp", "=== Model READY: " + m_impl->status.modelName +
             " | device=" + m_impl->status.device +
             " | gpuLayers=" + std::to_string(gpuLayers) +
@@ -215,12 +250,18 @@ namespace LocalNotebookLLM::Infrastructure {
             " prompt_len=" + std::to_string(prompt.size()) + " chars");
         auto startTime = std::chrono::steady_clock::now();
 
-        // ─── Tokenize prompt ───
-        const int n_prompt_max = m_impl->params.contextWindowSize;
-        std::vector<llama_token> promptTokens(n_prompt_max);
+        // ─── Reset cancellation token ───
+        // The token may have been set by a previous user cancel.
+        m_cancelToken.Reset();
+        m_cancelToken.ClearEvalProgress();
+        m_cancelToken.Heartbeat();  // Initial heartbeat so watchdog knows we've started
+
+        // ─── Tokenize full prompt ───
+        const int n_ctx = m_impl->params.contextWindowSize;
+        std::vector<llama_token> promptTokens(n_ctx);
         int n_prompt_tokens = llama_tokenize(
             m_impl->vocab, prompt.c_str(), static_cast<int>(prompt.size()),
-            promptTokens.data(), n_prompt_max,
+            promptTokens.data(), n_ctx,
             true,   // add BOS
             true    // special tokens
         );
@@ -236,8 +277,8 @@ namespace LocalNotebookLLM::Infrastructure {
         LOG_INFO("LlamaCpp", "Tokenized: " + std::to_string(n_prompt_tokens) + " tokens");
 
         // Check context overflow
-        if (n_prompt_tokens + maxTokens > m_impl->params.contextWindowSize) {
-            maxTokens = m_impl->params.contextWindowSize - n_prompt_tokens;
+        if (n_prompt_tokens + maxTokens > n_ctx) {
+            maxTokens = n_ctx - n_prompt_tokens;
             LOG_WARN("LlamaCpp", "Context overflow — clamped maxTokens to " + std::to_string(maxTokens));
             if (maxTokens <= 0) {
                 return std::unexpected(Core::LLMError{
@@ -247,47 +288,115 @@ namespace LocalNotebookLLM::Infrastructure {
             }
         }
 
-        // Clear KV cache for fresh generation
-        llama_memory_clear(llama_get_memory(m_impl->ctx), true);
+        // ─── KV-cache prefix reuse ───
+        // Hash the prompt to detect whether the document context has changed.
+        // If the same context is re-submitted (follow-up question in same session),
+        // we skip clearing the KV cache and re-evaluating the prefix — saving
+        // 10–40 seconds of prefill compute on every turn.
+        size_t promptHash = std::hash<std::string>{}(prompt);
+        bool cacheHit = (m_impl->kvCacheWarm && promptHash == m_impl->lastPromptHash
+                         && m_impl->lastPrefixTokens == n_prompt_tokens);
 
-        // ─── Evaluate prompt ───
-        LOG_DEBUG("LlamaCpp", "Evaluating prompt...");
-        llama_batch batch = llama_batch_init(n_prompt_tokens, 0, 1);
-        for (int i = 0; i < n_prompt_tokens; i++) {
-            llama_batch_add(batch, promptTokens[i], i, {0}, false);
+        if (cacheHit) {
+            LOG_INFO("LlamaCpp", "KV cache HIT — skipping prefix re-evaluation ("
+                + std::to_string(n_prompt_tokens) + " tokens preserved)");
+        } else {
+            LOG_INFO("LlamaCpp", "KV cache MISS — clearing and re-evaluating prefix");
+            llama_memory_clear(llama_get_memory(m_impl->ctx), true);
+
+            // Report eval progress so the UI knows we're about to do heavy work
+            m_cancelToken.ReportEvalProgress(0, n_prompt_tokens);
+
+            // Evaluate prompt
+            LOG_DEBUG("LlamaCpp", "Evaluating prompt...");
+            uint32_t n_batch = llama_n_batch(m_impl->ctx);
+            
+            // Process the prompt in chunks of n_batch
+            for (int i = 0; i < n_prompt_tokens; i += n_batch) {
+                // ─── CANCELLATION CHECKPOINT ─── (user-initiated only)
+                if (m_cancelToken.IsCancelled()) {
+                    LOG_WARN("LlamaCpp", "Cancelled during prompt evaluation at chunk " + std::to_string(i));
+                    m_impl->kvCacheWarm = false;
+                    m_cancelToken.ClearEvalProgress();
+                    return std::unexpected(Core::LLMError{
+                        Core::LLMError::Code::Cancelled,
+                        "Generation cancelled by user during prompt evaluation"
+                    });
+                }
+
+                int chunk_size = std::min(static_cast<int>(n_batch), n_prompt_tokens - i);
+                llama_batch batch = llama_batch_init(chunk_size, 0, 1);
+                
+                for (int j = 0; j < chunk_size; j++) {
+                    llama_batch_add(batch, promptTokens[i + j], i + j, {0}, false);
+                }
+                
+                // Only request logits for the very last token of the entire prompt
+                if (i + chunk_size == n_prompt_tokens) {
+                    batch.logits[batch.n_tokens - 1] = true;
+                }
+
+                if (llama_decode(m_impl->ctx, batch) != 0) {
+                    llama_batch_free(batch);
+                    LOG_ERROR("LlamaCpp", "Prompt evaluation FAILED at chunk " + std::to_string(i));
+                    m_cancelToken.ClearEvalProgress();
+                    return std::unexpected(Core::LLMError{
+                        Core::LLMError::Code::GenerationFailed,
+                        "Failed to evaluate prompt chunk"
+                    });
+                }
+                llama_batch_free(batch);
+
+                // ─── HEARTBEAT + PROGRESS ─── (after each successful decode)
+                // This proves to the watchdog that we're alive and making progress,
+                // even if each batch takes 10-30 seconds on CPU.
+                m_cancelToken.Heartbeat();
+                m_cancelToken.ReportEvalProgress(
+                    std::min(i + chunk_size, n_prompt_tokens), n_prompt_tokens);
+            }
+
+            // Record what we just cached
+            m_impl->lastPromptHash   = promptHash;
+            m_impl->lastPrefixTokens = n_prompt_tokens;
+            m_impl->kvCacheWarm      = true;
+            m_cancelToken.ClearEvalProgress();  // Eval phase complete
+            LOG_DEBUG("LlamaCpp", "Prompt evaluated and cached — starting token generation");
         }
-        batch.logits[batch.n_tokens - 1] = true;
 
-        if (llama_decode(m_impl->ctx, batch) != 0) {
-            llama_batch_free(batch);
-            LOG_ERROR("LlamaCpp", "Prompt evaluation FAILED");
-            return std::unexpected(Core::LLMError{
-                Core::LLMError::Code::GenerationFailed,
-                "Failed to evaluate prompt"
-            });
-        }
-        llama_batch_free(batch);
-        LOG_DEBUG("LlamaCpp", "Prompt evaluated — starting token generation");
-
-        // ─── Generate tokens ───
+        // ─── Generate tokens using cached sampler ───
         Core::GenerationResult result;
         result.tokensPrompt = n_prompt_tokens;
 
-        auto sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
-        llama_sampler_chain_add(sampler, llama_sampler_init_top_k(m_impl->params.topK));
-        llama_sampler_chain_add(sampler, llama_sampler_init_top_p(m_impl->params.topP, 1));
-        llama_sampler_chain_add(sampler, llama_sampler_init_temp(m_impl->params.temperature));
-        llama_sampler_chain_add(sampler, llama_sampler_init_dist(0));
+        // Reset sampler state for a fresh generation (without rebuilding the chain)
+        if (m_impl->sampler) {
+            llama_sampler_reset(m_impl->sampler);
+        } else {
+            // Fallback: build a new sampler if somehow not cached
+            m_impl->sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            llama_sampler_chain_add(m_impl->sampler, llama_sampler_init_top_k(m_impl->params.topK));
+            llama_sampler_chain_add(m_impl->sampler, llama_sampler_init_top_p(m_impl->params.topP, 1));
+            llama_sampler_chain_add(m_impl->sampler, llama_sampler_init_temp(m_impl->params.temperature));
+            llama_sampler_chain_add(m_impl->sampler, llama_sampler_init_dist(0));
+        }
 
         int n_decode = 0;
         int curPos = n_prompt_tokens;
 
         for (int i = 0; i < maxTokens; i++) {
-            llama_token newToken = llama_sampler_sample(sampler, m_impl->ctx, -1);
+            // ─── CANCELLATION CHECKPOINT ─── (between generated tokens)
+            if (m_cancelToken.IsCancelled()) {
+                LOG_WARN("LlamaCpp", "Cancelled during token generation at token " + std::to_string(i));
+                m_impl->kvCacheWarm = false;
+                break;  // Return partial result — whatever we generated so far
+            }
+
+            llama_token newToken = llama_sampler_sample(m_impl->sampler, m_impl->ctx, -1);
 
             // Check for end of generation
             if (llama_vocab_is_eog(m_impl->vocab, newToken)) {
                 LOG_DEBUG("LlamaCpp", "EOG token reached at position " + std::to_string(i));
+                // Invalidate cache — next generation's prefix will differ (new answer appended)
+                m_impl->kvCacheWarm = false;
                 break;
             }
 
@@ -298,6 +407,7 @@ namespace LocalNotebookLLM::Infrastructure {
                 std::string piece(buf, static_cast<size_t>(n));
                 result.text += piece;
                 if (callback) callback(piece);
+                m_cancelToken.Heartbeat();  // Prove we're alive during generation
             }
 
             // Prepare batch for next token
@@ -308,13 +418,12 @@ namespace LocalNotebookLLM::Infrastructure {
             if (llama_decode(m_impl->ctx, nextBatch) != 0) {
                 llama_batch_free(nextBatch);
                 LOG_WARN("LlamaCpp", "Decode error at token " + std::to_string(i) + " — returning partial");
+                m_impl->kvCacheWarm = false;  // Invalidate cache on error
                 break;
             }
             llama_batch_free(nextBatch);
             n_decode++;
         }
-
-        llama_sampler_free(sampler);
 
         auto endTime = std::chrono::steady_clock::now();
         result.tokensGenerated = n_decode;
@@ -373,6 +482,11 @@ namespace LocalNotebookLLM::Infrastructure {
         if (m_impl->loaded) {
             LOG_INFO("LlamaCpp", "UnloadModel: " + m_impl->status.modelName);
         }
+        // Free cached sampler
+        if (m_impl->sampler) {
+            llama_sampler_free(m_impl->sampler);
+            m_impl->sampler = nullptr;
+        }
         if (m_impl->ctx) {
             llama_free(m_impl->ctx);
             m_impl->ctx = nullptr;
@@ -383,6 +497,7 @@ namespace LocalNotebookLLM::Infrastructure {
         }
         m_impl->vocab = nullptr;
         m_impl->loaded = false;
+        m_impl->kvCacheWarm = false;
         m_impl->status = {};
 #endif
     }

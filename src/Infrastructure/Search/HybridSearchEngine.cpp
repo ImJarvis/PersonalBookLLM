@@ -5,8 +5,11 @@
 #include "Core/Log.h"
 #include <algorithm>
 #include <cctype>
+#include <numeric>
 #include <regex>
 #include <set>
+#include <sstream>
+#include <unordered_map>
 
 namespace LocalNotebookLLM::Infrastructure {
 
@@ -98,7 +101,7 @@ namespace LocalNotebookLLM::Infrastructure {
         std::vector<Core::HybridSearchResult> semanticResults;
         if (opts.enableEmbeddingFallback && m_embeddingProvider && m_embeddingProvider->IsLoaded() && m_db) {
             LOG_INFO("Search", "Tier 0 (Semantic): Embedding query...");
-            auto queryEmbResult = m_embeddingProvider->Embed(query);
+            auto queryEmbResult = m_embeddingProvider->Embed(query, true);
             if (queryEmbResult) {
                 const std::vector<float>& queryVec = *queryEmbResult;
 
@@ -323,44 +326,103 @@ namespace LocalNotebookLLM::Infrastructure {
         std::vector<Core::HybridSearchResult> results;
         results.reserve(headings.size() * 2);
 
-        for (const auto& h : headings) {
-            // Add the heading itself
-            Core::HybridSearchResult hr;
-            hr.nodeId          = h.id;
-            hr.documentId      = h.documentId;
-            hr.nodeType        = h.nodeType;
-            hr.pageNumber      = h.pageNumber;
-            hr.sectionPath     = h.sectionPath;
-            hr.content         = h.content;
-            hr.bm25Score       = 1.0;
-            hr.confidenceScore = 1.0;
-            hr.resolvedTier    = Core::SearchTier::Structural;
-            results.push_back(std::move(hr));
-
-            // Add the first paragraph child under this heading
-            auto childStmt = m_db->Prepare(R"(
-                SELECT id, document_id, node_type, page_number, section_path, content
-                FROM document_nodes
-                WHERE parent_id = ? AND node_type = 'paragraph' AND content != ''
-                ORDER BY sort_order
-                LIMIT 1
-            )");
-            childStmt.Bind(1, h.id);
-            if (childStmt.Step()) {
-                Core::HybridSearchResult childHr;
-                childHr.nodeId          = childStmt.GetInt64(0);
-                childHr.documentId      = childStmt.GetInt64(1);
-                childHr.nodeType        = Core::StringToNodeType(childStmt.GetString(2));
-                childHr.pageNumber      = childStmt.GetInt(3);
-                childHr.sectionPath     = childStmt.GetString(4);
-                childHr.content         = childStmt.GetString(5);
-                childHr.bm25Score       = 0.9;
-                childHr.confidenceScore = 0.9;
-                childHr.resolvedTier    = Core::SearchTier::Structural;
-                results.push_back(std::move(childHr));
+        // ── Batch child fetch: instead of 1 Prepare() per heading (O(N) SQL compiles),
+        //    build a single IN-clause query that fetches all first-paragraph children
+        //    in one round-trip — O(1) SQL compile regardless of heading count. ──
+        //
+        // Strategy: fetch the min sort_order paragraph id per parent, then join back
+        // to get full row data. This is equivalent to LIMIT 1 per parent_id.
+        if (!headings.empty()) {
+            // Build the IN list of heading IDs
+            std::ostringstream idList;
+            for (size_t idx = 0; idx < headings.size(); ++idx) {
+                if (idx > 0) idList << ",";
+                idList << headings[idx].id;
             }
 
-            if (static_cast<int>(results.size()) >= topK) break;
+            std::string batchSql = R"(
+                SELECT dn.id, dn.document_id, dn.node_type, dn.page_number, dn.section_path, dn.content, dn.parent_id
+                FROM document_nodes dn
+                INNER JOIN (
+                    SELECT parent_id, MIN(sort_order) AS min_sort
+                    FROM document_nodes
+                    WHERE parent_id IN ()" + idList.str() + R"()
+                    AND node_type = 'paragraph'
+                    AND content != ''
+                    GROUP BY parent_id
+                ) best ON dn.parent_id = best.parent_id AND dn.sort_order = best.min_sort
+                AND dn.node_type = 'paragraph'
+                ORDER BY dn.parent_id
+            )";
+
+            // Map heading id → heading info for quick lookup when merging
+            std::unordered_map<int64_t, size_t> headingIndexMap;
+            headingIndexMap.reserve(headings.size());
+            for (size_t idx = 0; idx < headings.size(); ++idx) {
+                headingIndexMap[headings[idx].id] = idx;
+            }
+
+            // Collect first-paragraph children keyed by parent_id
+            struct ChildRow {
+                int64_t id, documentId, parentId;
+                Core::NodeType nodeType;
+                int pageNumber;
+                std::string sectionPath, content;
+            };
+            std::vector<ChildRow> children;
+
+            auto batchStmt = m_db->Prepare(batchSql);
+            while (batchStmt.Step()) {
+                ChildRow row;
+                row.id          = batchStmt.GetInt64(0);
+                row.documentId  = batchStmt.GetInt64(1);
+                row.nodeType    = Core::StringToNodeType(batchStmt.GetString(2));
+                row.pageNumber  = batchStmt.GetInt(3);
+                row.sectionPath = batchStmt.GetString(4);
+                row.content     = batchStmt.GetString(5);
+                row.parentId    = batchStmt.GetInt64(6);
+                children.push_back(std::move(row));
+            }
+
+            // Build a map of parentId → child for O(1) lookup
+            std::unordered_map<int64_t, const ChildRow*> childMap;
+            childMap.reserve(children.size());
+            for (const auto& c : children) {
+                childMap[c.parentId] = &c;
+            }
+
+            // Interleave headings + their first child in reading order
+            for (const auto& h : headings) {
+                Core::HybridSearchResult hr;
+                hr.nodeId          = h.id;
+                hr.documentId      = h.documentId;
+                hr.nodeType        = h.nodeType;
+                hr.pageNumber      = h.pageNumber;
+                hr.sectionPath     = h.sectionPath;
+                hr.content         = h.content;
+                hr.bm25Score       = 1.0;
+                hr.confidenceScore = 1.0;
+                hr.resolvedTier    = Core::SearchTier::Structural;
+                results.push_back(std::move(hr));
+
+                auto it = childMap.find(h.id);
+                if (it != childMap.end()) {
+                    const auto* c = it->second;
+                    Core::HybridSearchResult childHr;
+                    childHr.nodeId          = c->id;
+                    childHr.documentId      = c->documentId;
+                    childHr.nodeType        = c->nodeType;
+                    childHr.pageNumber      = c->pageNumber;
+                    childHr.sectionPath     = c->sectionPath;
+                    childHr.content         = c->content;
+                    childHr.bm25Score       = 0.9;
+                    childHr.confidenceScore = 0.9;
+                    childHr.resolvedTier    = Core::SearchTier::Structural;
+                    results.push_back(std::move(childHr));
+                }
+
+                if (static_cast<int>(results.size()) >= topK) break;
+            }
         }
 
         return results;

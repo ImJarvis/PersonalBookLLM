@@ -4,6 +4,7 @@ add_library(Infrastructure STATIC
     Parsing/DocxParser.cpp
     Parsing/PdfParser.cpp
     Parsing/CompositeParser.cpp
+    Parsing/PdfVlmParser.cpp
     Parsing/TextQualityValidator.cpp
     Indexing/DatabaseManager.cpp
     Indexing/SqliteFts5Indexer.cpp

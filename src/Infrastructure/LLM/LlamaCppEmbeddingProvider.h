@@ -17,7 +17,7 @@ namespace LocalNotebookLLM::Infrastructure {
 
         [[nodiscard]]
         std::expected<std::vector<float>, std::string>
-        Embed(const std::string& text) override;
+        Embed(const std::string& text, bool isQuery = false) override;
 
         [[nodiscard]]
         std::expected<std::vector<std::vector<float>>, std::string>

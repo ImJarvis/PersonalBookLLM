@@ -29,6 +29,11 @@ namespace LocalNotebookLLM::Infrastructure {
     struct LlamaCppEmbeddingProvider::Impl {
         bool loaded = false;
         size_t dimensions = 0;
+        // nomic-embed-text requires task prefixes for optimal retrieval quality:
+        //   passages indexed  → "search_document: "
+        //   user query        → "search_query: "
+        // We auto-detect this by model filename at load time.
+        bool isNomicModel = false;
 #ifdef HAS_LLAMA_CPP
         llama_model* model = nullptr;
         llama_context* ctx = nullptr;
@@ -92,7 +97,15 @@ namespace LocalNotebookLLM::Infrastructure {
         
         m_impl->dimensions = static_cast<size_t>(n_embd);
         m_impl->loaded = true;
-        
+
+        // Auto-detect nomic-embed: requires task prefixes for optimal performance
+        std::string modelName = modelPath.filename().string();
+        for (auto& c : modelName) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        m_impl->isNomicModel = (modelName.find("nomic") != std::string::npos);
+        if (m_impl->isNomicModel) {
+            LOG_INFO("LlamaCppEmbed", "nomic-embed detected — will apply task prefixes automatically");
+        }
+
         LOG_INFO("LlamaCppEmbed", "Successfully loaded embedding model. Dimensions: " + std::to_string(n_embd));
         return {};
 #else
@@ -101,7 +114,7 @@ namespace LocalNotebookLLM::Infrastructure {
     }
 
     std::expected<std::vector<float>, std::string>
-    LlamaCppEmbeddingProvider::Embed(const std::string& text) {
+    LlamaCppEmbeddingProvider::Embed(const std::string& text, bool isQuery) {
 #ifdef HAS_LLAMA_CPP
         std::lock_guard lock(m_mutex);
 
@@ -109,10 +122,17 @@ namespace LocalNotebookLLM::Infrastructure {
             return std::unexpected("Embedding model not loaded");
         }
         
+        // Apply nomic task prefix for retrieval passages
+        // (nomic-embed-text-v1.5 requires "search_document: " prefix on indexed text)
+        std::string prefixedText = text;
+        if (m_impl->isNomicModel) {
+            prefixedText = (isQuery ? "search_query: " : "search_document: ") + text;
+        }
+
         // Tokenize
         std::vector<llama_token> tokens(2048);
         int n_tokens = llama_tokenize(
-            m_impl->vocab, text.c_str(), static_cast<int>(text.size()),
+            m_impl->vocab, prefixedText.c_str(), static_cast<int>(prefixedText.size()),
             tokens.data(), static_cast<int>(tokens.size()),
             true, true
         );
@@ -176,12 +196,15 @@ namespace LocalNotebookLLM::Infrastructure {
 
         llama_memory_clear(llama_get_memory(m_impl->ctx), true);
 
-        // Pre-tokenize all strings
+        // Pre-tokenize all strings (with nomic prefix if needed)
         std::vector<std::vector<llama_token>> all_tokens;
         int total_tokens = 0;
         for (const auto& txt : texts) {
+            std::string prefixed = m_impl->isNomicModel
+                ? "search_document: " + txt
+                : txt;
             std::vector<llama_token> tokens(2048);
-            int n = llama_tokenize(m_impl->vocab, txt.c_str(), static_cast<int>(txt.size()), tokens.data(), static_cast<int>(tokens.size()), true, true);
+            int n = llama_tokenize(m_impl->vocab, prefixed.c_str(), static_cast<int>(prefixed.size()), tokens.data(), static_cast<int>(tokens.size()), true, true);
             if (n < 0) return std::unexpected("A chunk exceeds context limit");
             tokens.resize(n);
             total_tokens += n;

@@ -10,6 +10,7 @@
 #include <mutex>
 #include <future>
 #include <deque>
+#include <chrono>
 
 namespace LocalNotebookLLM::Core {
     class IEmbeddingProvider;
@@ -50,6 +51,9 @@ namespace LocalNotebookLLM::UI {
         bool generating = false;
         std::string generationStatus;
         std::string streamingAnswer;  // Partial answer during streaming
+        std::chrono::steady_clock::time_point lastActivityTime; // Watchdog timer
+        std::chrono::steady_clock::time_point generationStartTime; // When generation started
+        double elapsedGenerationSec = 0.0; // Updated every frame for UI display
 
         // ─── Reasoner Model (Q&A) ───
         bool reasonerLoaded = false;
@@ -104,6 +108,10 @@ namespace LocalNotebookLLM::UI {
         /// Ask a question (async, populates chat history).
         void AskQuestion(const std::string& query);
 
+        /// Cancel the current generation (cooperative — signals the LLM to stop
+        /// at the next safe checkpoint; does NOT destroy the model).
+        void CancelGeneration();
+
         /// Load the Reasoner model (async). Used for Q&A.
         void LoadReasonerModel(const std::filesystem::path& modelPath);
 
@@ -143,6 +151,7 @@ namespace LocalNotebookLLM::UI {
         // Async futures
         std::future<void> m_ingestionFuture;
         std::future<void> m_generationFuture;
+        std::vector<std::future<void>> m_abandonedFutures; // Keep hung threads here so we don't block the UI thread on destructor assignment
         std::future<void> m_reasonerLoadFuture;
         std::future<void> m_workerLoadFuture;
 

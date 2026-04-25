@@ -40,10 +40,15 @@ namespace LocalNotebookLLM::Infrastructure {
         /// Get detailed model status.
         [[nodiscard]] Core::ModelStatus GetStatus() const;
 
+        /// Cooperative cancellation token — checked between batch chunks and
+        /// between generated tokens.  Safe to call Cancel() from any thread.
+        Core::CancellationToken& GetCancellationToken() override { return m_cancelToken; }
+
     private:
         struct Impl;
-        std::unique_ptr<Impl> m_impl;
-        mutable std::mutex    m_mutex;  // Serialize access to llama context
+        std::unique_ptr<Impl>     m_impl;
+        mutable std::mutex        m_mutex;      // Serialize access to llama context
+        Core::CancellationToken   m_cancelToken; // Cooperative abort flag
     };
 
 } // namespace LocalNotebookLLM::Infrastructure

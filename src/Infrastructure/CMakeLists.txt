@@ -10,6 +10,7 @@ add_library(Infrastructure STATIC
     Indexing/SqliteFts5Indexer.cpp
     Search/StructuralNavigator.cpp
     Search/HybridSearchEngine.cpp
+    Search/ReRanker.cpp
     LLM/LlamaCppProvider.cpp
     LLM/LlamaCppEmbeddingProvider.cpp
     LLM/MemoryOrchestrator.cpp

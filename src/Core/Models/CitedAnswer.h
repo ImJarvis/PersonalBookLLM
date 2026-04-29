@@ -9,7 +9,8 @@ namespace LocalNotebookLLM::Core {
     struct Citation {
         int         pageNumber  = 0;
         std::string sectionPath;
-        std::string citedText;     // The specific text that was cited
+        std::string citedText;      // The specific text that was cited
+        std::string documentName;   // Source filename for multi-doc citation
         bool        isVerified  = false; // Post-generation validation result
     };
 

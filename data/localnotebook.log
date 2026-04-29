@@ -1,0 +1,162 @@
+18:31:18.532 [INFO ] [Logger] === LocalNotebookLLM Session Started ===
+18:31:18.533 [INFO ] [Logger] Log file: D:\Projects\LocalNotebookLLM\data\localnotebook.log
+18:31:18.533 [INFO ] [Main] === WinMain Entry ===
+18:31:18.533 [INFO ] [Main] CWD: D:\Projects\LocalNotebookLLM
+18:31:18.533 [INFO ] [Main] Window class registered
+18:31:18.538 [INFO ] [Main] Window created: 2622618
+18:31:18.552 [INFO ] [Main] DirectX 11 device created successfully
+18:31:18.570 [INFO ] [Main] Mica backdrop: not available
+18:31:18.571 [INFO ] [Main] ImGui context created
+18:31:18.571 [WARN ] [Main] System font not found, using ImGui default
+18:31:18.571 [INFO ] [Main] Apple dark theme applied
+18:31:18.573 [INFO ] [Main] ImGui backends initialized (Win32 + DX11)
+18:31:18.573 [INFO ] [Main] Initializing App with data dir: D:\Projects\LocalNotebookLLM\data
+18:31:18.573 [INFO ] [App] === Initialize() begin ===
+18:31:18.573 [INFO ] [App] Data dir:   D:\Projects\LocalNotebookLLM\data
+18:31:18.573 [INFO ] [App] Models dir: D:/Projects/LocalNotebookLLM/models
+18:31:18.574 [INFO ] [App] Opening database: D:\Projects\LocalNotebookLLM\data\notebook.db
+18:31:18.574 [INFO ] [Database] Opening database: D:\Projects\LocalNotebookLLM\data\notebook.db
+18:31:18.575 [INFO ] [Database] Configuring PRAGMAs...
+18:31:18.582 [INFO ] [Database] Initializing schema...
+18:31:18.590 [INFO ] [Database] Database ready
+18:31:18.590 [INFO ] [App] Database initialized with WAL + FTS5
+18:31:18.590 [INFO ] [App] Indexer + Repository created
+18:31:18.590 [INFO ] [App] CompositeParser created (DOCX + PDF VLM support)
+18:31:18.590 [INFO ] [LlamaCpp] Backend initialized natively (once globally)
+18:31:18.590 [INFO ] [App] Dual LlamaCppProvider instances created (Worker + Reasoner)
+18:31:18.590 [INFO ] [MemOrch] MemoryOrchestrator created (Worker + Reasoner providers)
+18:31:18.590 [INFO ] [App] MemoryOrchestrator created
+18:31:18.590 [INFO ] [App] Worker model path:   D:/Projects/LocalNotebookLLM/models\qwen2.5-coder-1.5b-instruct-q4_k_m.gguf (exists: YES)
+18:31:18.590 [INFO ] [App] Reasoner model path: D:/Projects/LocalNotebookLLM/models\gemma-3-4b-it-Q4_K_M.gguf (exists: YES)
+18:31:18.591 [INFO ] [App] Worker config set: 2048 ctx, 0.1 temp, ~1024 MB
+18:31:18.591 [INFO ] [App] Reasoner config set: 8192 ctx, 0.3 temp, ~2560 MB
+18:31:18.591 [INFO ] [App] DocumentService created
+18:31:18.591 [INFO ] [App] HybridSearchEngine created (BM25 + Structural + Semantic)
+18:31:18.591 [INFO ] [App] InferenceService created
+18:31:18.591 [DEBUG] [App] RefreshDocumentList: 0 docs
+18:31:18.591 [INFO ] [App] Document list loaded: 0 docs
+18:31:18.591 [INFO ] [App] Starting model auto-detection...
+18:31:18.591 [INFO ] [App] AutoDetectAndLoadModels() begin
+18:31:18.591 [DEBUG] [App]   Checking worker candidate: D:/Projects/LocalNotebookLLM/models\qwen2.5-coder-1.5b-instruct-q4_k_m.gguf
+18:31:18.591 [INFO ] [App]   Worker model found: qwen2.5-coder-1.5b-instruct-q4_k_m.gguf
+18:31:18.591 [INFO ] [App] Auto-loading Worker: qwen2.5-coder-1.5b-instruct-q4_k_m.gguf
+18:31:18.591 [INFO ] [App] LoadWorkerModel() path: D:/Projects/LocalNotebookLLM/models\qwen2.5-coder-1.5b-instruct-q4_k_m.gguf
+18:31:18.591 [DEBUG] [App]   Checking reasoner candidate: D:/Projects/LocalNotebookLLM/models\Phi-4-mini-instruct-Q4_K_M.gguf
+18:31:18.591 [INFO ] [App] [async] Worker load thread started: qwen2.5-coder-1.5b-instruct-q4_k_m.gguf
+18:31:18.591 [INFO ] [LlamaCpp] LoadModel() path: D:/Projects/LocalNotebookLLM/models\qwen2.5-coder-1.5b-instruct-q4_k_m.gguf
+18:31:18.591 [INFO ] [LlamaCpp] Model file size: 940 MB
+18:31:18.591 [INFO ] [App]   Reasoner model found: Phi-4-mini-instruct-Q4_K_M.gguf
+18:31:18.591 [INFO ] [App] Auto-loading Reasoner: Phi-4-mini-instruct-Q4_K_M.gguf
+18:31:18.591 [INFO ] [App] LoadReasonerModel() path: D:/Projects/LocalNotebookLLM/models\Phi-4-mini-instruct-Q4_K_M.gguf
+18:31:18.591 [INFO ] [App]   Embed model found: nomic-embed-text-v1.5.f16.gguf
+18:31:18.592 [INFO ] [App] [async] Reasoner load thread started: Phi-4-mini-instruct-Q4_K_M.gguf
+18:31:18.592 [INFO ] [App] Detected Phi model — set KV cache to F16 to prevent crashes, keeping Flash Attention enabled for speed.
+18:31:18.592 [INFO ] [LlamaCpp] LoadModel() path: D:/Projects/LocalNotebookLLM/models\Phi-4-mini-instruct-Q4_K_M.gguf
+18:31:18.592 [INFO ] [LlamaCpp] Model file size: 2376 MB
+18:31:18.595 [INFO ] [LlamaCpp] GPU detected: Intel(R) HD Graphics 4600 (VRAM: 112 MB, free: 112 MB) → 0 GPU layers
+18:31:18.596 [INFO ] [LlamaCpp] Loading model file (this may take a moment)...
+18:31:18.596 [INFO ] [LlamaCpp] GPU detected: Intel(R) HD Graphics 4600 (VRAM: 112 MB, free: 112 MB) → 0 GPU layers
+18:31:18.596 [INFO ] [LlamaCpp] Loading model file (this may take a moment)...
+18:31:19.135 [INFO ] [LlamaCppEmbed] nomic-embed detected — will apply task prefixes automatically
+18:31:19.135 [INFO ] [LlamaCppEmbed] Successfully loaded embedding model. Dimensions: 768
+18:31:19.135 [INFO ] [App] Loaded embedding model: nomic-embed-text-v1.5.f16.gguf
+18:31:19.135 [INFO ] [App] AutoDetectAndLoadModels() complete
+18:31:19.135 [INFO ] [App] === Initialize() complete ===
+18:31:19.135 [INFO ] [Main] App initialization complete — entering main loop
+18:31:25.594 [INFO ] [LlamaCpp] Model loaded in 6998.710900 ms
+18:31:25.594 [INFO ] [LlamaCpp] Context params: n_ctx=2048 n_threads=3 flash_attn=ON
+18:31:25.656 [INFO ] [LlamaCpp] Sampler chain built and cached
+18:31:25.656 [INFO ] [LlamaCpp] === Model READY: qwen2.5-coder-1.5b-instruct-q4_k_m.gguf | device=CPU | gpuLayers=0 | ctx=2048 ===
+18:31:25.656 [INFO ] [App] [async] Worker LOADED: qwen2.5-coder-1.5b-instruct-q4_k_m.gguf
+18:31:31.638 [INFO ] [LlamaCpp] Model loaded in 13041.929100 ms
+18:31:31.638 [INFO ] [LlamaCpp] Context params: n_ctx=8192 n_threads=3 flash_attn=ON
+18:31:32.113 [INFO ] [LlamaCpp] Sampler chain built and cached
+18:31:32.113 [INFO ] [LlamaCpp] === Model READY: Phi-4-mini-instruct-Q4_K_M.gguf | device=CPU | gpuLayers=0 | ctx=8192 ===
+18:31:32.113 [INFO ] [App] [async] Reasoner LOADED: Phi-4-mini-instruct-Q4_K_M.gguf
+18:31:47.117 [INFO ] [App] IngestDocument() begin: D:\FROM C\Agreement_2024.pdf
+18:31:47.117 [INFO ] [App] [async] Ingestion thread started for: Agreement_2024.pdf
+18:31:47.117 [INFO ] [DocService] IngestDocument() path: D:\FROM C\Agreement_2024.pdf
+18:31:47.118 [DEBUG] [DocService] Computing file hash...
+18:31:47.178 [DEBUG] [DocService] Hash: 1ae300ccc839c9ed491a3427438c320b329e62a418454091229899cb6c81d130
+18:31:47.180 [INFO ] [PdfParser] ParseFile() begin: D:\FROM C\Agreement_2024.pdf
+18:31:47.184 [INFO ] [PdfParser] Opened PDF: 6 pages
+18:31:47.228 [INFO ] [PdfParser] Extracted 110 text blocks from 6 pages
+18:31:47.229 [INFO ] [PdfParser] ParseFile() complete: 111 nodes, 6 pages
+18:31:47.229 [INFO ] [PdfVlmParser] Heuristic parser succeeded with good text density. Skipping VLM.
+18:31:47.229 [INFO ] [DocService] Parsed: 6 pages, 111 nodes
+18:31:47.265 [INFO ] [DocService] Ingestion COMPLETE: Agreement_2024.pdf — 111 sections, 6 pages
+18:31:47.266 [DEBUG] [App] RefreshDocumentList: 1 docs
+18:32:34.960 [INFO ] [App] AskQuestion() query: "What is this documnet about ? Which parties are allowed here name all of them? Quote important date and financial data from this doc"
+18:32:34.961 [INFO ] [App] [async] Q&A thread started
+18:32:34.961 [INFO ] [Inference] AskQuestionStreaming() query: "What is this documnet about ? Which parties are allowed here name all of them? Quote important date and financial data from this doc"
+18:32:34.961 [INFO ] [Search] Search() query: "What is this documnet about ? Which parties are allowed here name all of them? Quote important date and financial data from this doc" topK=10
+18:32:34.961 [INFO ] [Search] Intent: ChapterSummary
+18:32:34.961 [INFO ] [Search] ChapterSummary path: 0 chapter nodes
+18:32:34.961 [DEBUG] [Search] FTS query: ""what" OR "documnet" OR "about" OR "which" OR "parties" OR "allowed" OR "name" OR "quote" OR "important" OR "date" OR "financial" OR "data" OR "doc""
+18:32:34.965 [INFO ] [Search] Tier 1 (BM25): 30 results
+18:32:34.966 [INFO ] [Search] Tier 2 (Structural): 33 results
+18:32:34.966 [INFO ] [Search] Tier 3 (Semantic): Embedding query...
+18:32:35.520 [INFO ] [Search] Tier 3 (Semantic): 0 matches > 0.3
+18:32:35.520 [INFO ] [Search] RRF fused: 34 results
+18:32:35.521 [DEBUG] [ReRanker] Re-ranked 34 results
+18:32:35.522 [INFO ] [Search] Returning 10 final results
+18:32:35.522 [INFO ] [LlamaCpp] GenerateStreaming() maxTokens=2048 prompt_len=4840 chars
+18:32:35.552 [INFO ] [LlamaCpp] Tokenized: 1276 tokens
+18:32:35.552 [INFO ] [LlamaCpp] KV cache MISS — clearing and re-evaluating prefix
+18:32:35.671 [DEBUG] [LlamaCpp] Evaluating prompt...
+18:34:56.766 [DEBUG] [LlamaCpp] Prompt evaluated and cached — starting token generation
+18:50:38.579 [INFO ] [LlamaCpp] Generation complete: 2048 tokens in 1083056.492800 ms (1.890945 tok/s) [TRUNCATED]
+19:22:39.060 [INFO ] [App] AskQuestion() query: "When is the lease getting expired ? Date"
+19:22:39.060 [INFO ] [App] [async] Q&A thread started
+19:22:39.060 [INFO ] [Inference] AskQuestionStreaming() query: "When is the lease getting expired ? Date"
+19:22:39.060 [INFO ] [Search] Search() query: "When is the lease getting expired ? Date" topK=10
+19:22:39.060 [INFO ] [Search] Intent: Keyword
+19:22:39.060 [DEBUG] [Search] FTS query: ""lease" OR "getting" OR "expired" OR "date""
+19:22:39.061 [INFO ] [Search] Tier 1 (BM25): 15 results
+19:22:39.061 [INFO ] [Search] Tier 2 (Structural): 7 results
+19:22:39.061 [INFO ] [Search] Tier 3 (Semantic): Embedding query...
+19:22:39.078 [ERROR] [App] Heartbeat watchdog: inference thread unresponsive for >10 min. Thread is likely crashed. Abandoning and recovering.
+19:22:39.078 [INFO ] [Inference] LLM Provider updated successfully
+19:22:39.078 [INFO ] [App] LoadReasonerModel() path: D:/Projects/LocalNotebookLLM/models\Phi-4-mini-instruct-Q4_K_M.gguf
+19:22:39.078 [INFO ] [App] [async] Reasoner load thread started: Phi-4-mini-instruct-Q4_K_M.gguf
+19:22:39.078 [INFO ] [App] Detected Phi model — set KV cache to F16 to prevent crashes, keeping Flash Attention enabled for speed.
+19:22:39.078 [INFO ] [LlamaCpp] LoadModel() path: D:/Projects/LocalNotebookLLM/models\Phi-4-mini-instruct-Q4_K_M.gguf
+19:22:39.078 [INFO ] [LlamaCpp] Model file size: 2376 MB
+19:22:39.079 [INFO ] [LlamaCpp] GPU detected: Intel(R) HD Graphics 4600 (VRAM: 112 MB, free: 103 MB) → 0 GPU layers
+19:22:39.079 [INFO ] [LlamaCpp] Loading model file (this may take a moment)...
+19:22:39.136 [INFO ] [Search] Tier 3 (Semantic): 0 matches > 0.3
+19:22:39.136 [INFO ] [Search] RRF fused: 16 results
+19:22:39.136 [DEBUG] [ReRanker] Re-ranked 16 results
+19:22:39.136 [INFO ] [Search] Returning 10 final results
+19:22:43.544 [INFO ] [LlamaCpp] Model loaded in 4465.326400 ms
+19:22:43.544 [INFO ] [LlamaCpp] Context params: n_ctx=8192 n_threads=3 flash_attn=ON
+19:22:44.222 [INFO ] [LlamaCpp] Sampler chain built and cached
+19:22:44.222 [INFO ] [LlamaCpp] === Model READY: Phi-4-mini-instruct-Q4_K_M.gguf | device=CPU | gpuLayers=0 | ctx=8192 ===
+19:22:44.222 [INFO ] [App] [async] Reasoner LOADED: Phi-4-mini-instruct-Q4_K_M.gguf
+19:22:44.222 [INFO ] [LlamaCpp] GenerateStreaming() maxTokens=1024 prompt_len=4077 chars
+19:22:44.230 [INFO ] [LlamaCpp] Tokenized: 964 tokens
+19:22:44.230 [INFO ] [LlamaCpp] KV cache MISS — clearing and re-evaluating prefix
+19:22:44.306 [DEBUG] [LlamaCpp] Evaluating prompt...
+19:22:51.907 [INFO ] [App] AskQuestion() query: "Lease expiry date please"
+19:22:51.907 [INFO ] [App] [async] Q&A thread started
+19:22:51.907 [INFO ] [Inference] AskQuestionStreaming() query: "Lease expiry date please"
+19:24:56.676 [DEBUG] [LlamaCpp] Prompt evaluated and cached — starting token generation
+19:26:00.645 [DEBUG] [LlamaCpp] EOG token reached at position 156
+19:26:00.645 [INFO ] [LlamaCpp] Generation complete: 156 tokens in 196422.869500 ms (0.794205 tok/s)
+19:26:00.645 [INFO ] [Search] Search() query: "Lease expiry date please" topK=10
+19:26:00.645 [INFO ] [Search] Intent: Keyword
+19:26:00.646 [DEBUG] [Search] FTS query: ""lease" OR "expiry" OR "date" OR "please""
+19:26:00.647 [INFO ] [Search] Tier 1 (BM25): 15 results
+19:26:00.648 [INFO ] [Search] Tier 2 (Structural): 8 results
+19:26:00.649 [INFO ] [Search] Tier 3 (Semantic): Embedding query...
+19:26:00.746 [INFO ] [Search] Tier 3 (Semantic): 0 matches > 0.3
+19:26:00.746 [INFO ] [Search] RRF fused: 16 results
+19:26:00.746 [DEBUG] [ReRanker] Re-ranked 16 results
+19:26:00.746 [INFO ] [Search] Returning 10 final results
+19:26:00.747 [INFO ] [LlamaCpp] GenerateStreaming() maxTokens=1024 prompt_len=4061 chars
+19:26:00.763 [INFO ] [LlamaCpp] Tokenized: 960 tokens
+19:26:00.763 [INFO ] [LlamaCpp] KV cache MISS — clearing and re-evaluating prefix
+19:26:00.847 [DEBUG] [LlamaCpp] Evaluating prompt...
+19:32:41.631 [DEBUG] [LlamaCpp] Prompt evaluated and cached — starting token generation
+19:33:07.437 [DEBUG] [LlamaCpp] EOG token reached at position 23
+19:33:07.438 [INFO ] [LlamaCpp] Generation complete: 23 tokens in 426690.988700 ms (0.053903 tok/s)

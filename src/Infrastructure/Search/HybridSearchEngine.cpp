@@ -1,10 +1,12 @@
 #include "Infrastructure/Search/HybridSearchEngine.h"
+#include "Infrastructure/Search/ReRanker.h"
 #include "Application/QueryAnalyzer.h"
 #include "Infrastructure/Indexing/DatabaseManager.h"
 #include <sqlite3.h>
 #include "Core/Log.h"
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <numeric>
 #include <regex>
 #include <set>
@@ -60,47 +62,26 @@ namespace LocalNotebookLLM::Infrastructure {
         std::string ftsQuery = Application::QueryAnalyzer::Analyze(query);
         LOG_DEBUG("Search", "FTS query: \"" + ftsQuery + "\"");
 
-        // ═══════════════════ TIER 1: BM25 Keyword Search ═══════════════════
+        // ═══════════════════ ALWAYS RUN ALL 3 TIERS ═══════════════════
+        // Previous cascading fallback skipped semantic search when BM25 was confident.
+        // RRF fusion requires rank lists from all tiers to produce optimal results.
+
+        // ── TIER 1: BM25 Keyword Search ──
         Core::SearchOptions searchOpts;
-        searchOpts.topK = opts.topK * 2;  // Fetch extra for filtering
+        searchOpts.topK = opts.topK * 3;  // Fetch extra for RRF fusion
         searchOpts.documentIdFilter = opts.documentIdFilter;
 
         auto bm25Results = m_fts5Indexer->Search(ftsQuery, searchOpts);
         LOG_INFO("Search", "Tier 1 (BM25): " + std::to_string(bm25Results.size()) + " results");
 
-        if (!bm25Results.empty()) {
-            double topScore = bm25Results[0].bm25Score;
-            LOG_DEBUG("Search", "  Top BM25 score: " + std::to_string(topScore) +
-                " (threshold: " + std::to_string(opts.bm25ConfidenceThreshold) + ")");
-            if (topScore >= opts.bm25ConfidenceThreshold) {
-                LOG_INFO("Search", "  BM25 confident — returning Tier 1 results");
-                return ConvertToHybrid(bm25Results, Core::SearchTier::BM25, opts.topK);
-            }
-        }
+        // ── TIER 2: Structural Tree Navigation ──
+        auto structuralResults = m_navigator->Navigate(query, opts.topK * 2);
+        LOG_INFO("Search", "Tier 2 (Structural): " + std::to_string(structuralResults.size()) + " results");
 
-        // ═══════════════════ TIER 2: Structural Tree Navigation ═══════════════════
-        LOG_INFO("Search", "Tier 2 (Structural): navigating...");
-        auto structuralResults = m_navigator->Navigate(query, opts.topK);
-        LOG_INFO("Search", "Tier 2: " + std::to_string(structuralResults.size()) + " results");
-
-        // Merge BM25 + structural results
-        auto bm25Hybrid = ConvertToHybrid(bm25Results, Core::SearchTier::BM25, opts.topK * 2);
-        auto structHybrid = ConvertToHybrid(structuralResults, Core::SearchTier::Structural, opts.topK * 2);
-        auto merged = MergeAndDeduplicate(bm25Hybrid, structHybrid);
-        LOG_INFO("Search", "Merged: " + std::to_string(merged.size()) + " results");
-
-        if (!merged.empty()) {
-            double topConfidence = merged[0].confidenceScore;
-            if (topConfidence >= opts.structuralConfidenceThreshold) {
-                LOG_INFO("Search", "  Structural confident — returning merged results");
-                return TakeTop(merged, opts.topK);
-            }
-        }
-
-        // ═══════════════════ TIER 0: Semantic Embedding Matching ═══════════════════
+        // ── TIER 3: Semantic Embedding Matching ──
         std::vector<Core::HybridSearchResult> semanticResults;
         if (opts.enableEmbeddingFallback && m_embeddingProvider && m_embeddingProvider->IsLoaded() && m_db) {
-            LOG_INFO("Search", "Tier 0 (Semantic): Embedding query...");
+            LOG_INFO("Search", "Tier 3 (Semantic): Embedding query...");
             auto queryEmbResult = m_embeddingProvider->Embed(query, true);
             if (queryEmbResult) {
                 const std::vector<float>& queryVec = *queryEmbResult;
@@ -134,7 +115,7 @@ namespace LocalNotebookLLM::Infrastructure {
                                 score += queryVec[i] * blob[i];
                             }
                             
-                            if (score > 0.4f) {
+                            if (score > 0.3f) {  // Lower threshold for RRF — let fusion decide
                                 Core::SearchResult r;
                                 r.nodeId = stmt.GetInt64(0);
                                 r.documentId = stmt.GetInt64(1);
@@ -153,7 +134,7 @@ namespace LocalNotebookLLM::Infrastructure {
                     return a.score > b.score;
                 });
                 
-                for (size_t i = 0; i < candidates.size() && i < static_cast<size_t>(opts.topK); ++i) {
+                for (size_t i = 0; i < candidates.size() && i < static_cast<size_t>(opts.topK * 2); ++i) {
                     Core::HybridSearchResult hr;
                     hr.nodeId = candidates[i].res.nodeId;
                     hr.documentId = candidates[i].res.documentId;
@@ -163,17 +144,29 @@ namespace LocalNotebookLLM::Infrastructure {
                     hr.content = candidates[i].res.content;
                     hr.bm25Score = candidates[i].score;
                     hr.confidenceScore = candidates[i].score;
-                    hr.resolvedTier = Core::SearchTier::Structural;
+                    hr.resolvedTier = Core::SearchTier::Embedding;
                     semanticResults.push_back(std::move(hr));
                 }
-                LOG_INFO("Search", "Tier 0 (Semantic): " + std::to_string(semanticResults.size()) + " matches > 0.4");
+                LOG_INFO("Search", "Tier 3 (Semantic): " + std::to_string(semanticResults.size()) + " matches > 0.3");
             }
         }
 
-        merged = MergeAndDeduplicate(merged, semanticResults);
+        // ═══════════════════ RRF FUSION ═══════════════════
+        // Reciprocal Rank Fusion: RRF_score(doc) = Σ 1/(k + rank_in_tier_i)
+        // k=60 is the standard constant. This normalizes scores across tiers
+        // where BM25, cosine similarity, and structural scores are on different scales.
+        auto bm25Hybrid = ConvertToHybrid(bm25Results, Core::SearchTier::BM25, opts.topK * 3);
+        auto structHybrid = ConvertToHybrid(structuralResults, Core::SearchTier::Structural, opts.topK * 2);
 
-        LOG_INFO("Search", "Returning " + std::to_string(merged.size()) + " final results");
-        return TakeTop(merged, opts.topK);
+        auto fused = FuseWithRRF(bm25Hybrid, structHybrid, semanticResults, 60);
+        LOG_INFO("Search", "RRF fused: " + std::to_string(fused.size()) + " results");
+
+        // ═══════════════════ RE-RANKER ═══════════════════
+        // Token-overlap re-ranker verifies that passages actually contain query-relevant terms.
+        auto reranked = ReRanker::ReRank(query, fused);
+
+        LOG_INFO("Search", "Returning " + std::to_string(std::min(static_cast<int>(reranked.size()), opts.topK)) + " final results");
+        return TakeTop(reranked, opts.topK);
     }
 
 
@@ -241,6 +234,54 @@ namespace LocalNotebookLLM::Infrastructure {
         if (static_cast<int>(results.size()) <= n) return results;
         results.resize(static_cast<size_t>(n));
         return results;
+    }
+
+    std::vector<Core::HybridSearchResult>
+    HybridSearchEngine::FuseWithRRF(
+        const std::vector<Core::HybridSearchResult>& bm25,
+        const std::vector<Core::HybridSearchResult>& structural,
+        const std::vector<Core::HybridSearchResult>& semantic,
+        int k)
+    {
+        // RRF_score(doc) = Σ 1/(k + rank_in_tier_i)
+        // k=60 is standard. Documents appearing in multiple tiers get additive boosts.
+        std::unordered_map<int64_t, double> rrfScores;
+        std::unordered_map<int64_t, Core::HybridSearchResult> bestResult;
+
+        auto addTier = [&](const std::vector<Core::HybridSearchResult>& tier) {
+            for (size_t rank = 0; rank < tier.size(); ++rank) {
+                int64_t id = tier[rank].nodeId;
+                double contribution = 1.0 / (k + static_cast<int>(rank) + 1);
+                rrfScores[id] += contribution;
+                
+                // Keep the result with the most information
+                if (bestResult.find(id) == bestResult.end() ||
+                    tier[rank].content.size() > bestResult[id].content.size()) {
+                    bestResult[id] = tier[rank];
+                }
+            }
+        };
+
+        addTier(bm25);
+        addTier(structural);
+        addTier(semantic);
+
+        // Build fused results with RRF scores
+        std::vector<Core::HybridSearchResult> fused;
+        fused.reserve(rrfScores.size());
+        for (auto& [nodeId, score] : rrfScores) {
+            auto result = bestResult[nodeId];
+            result.confidenceScore = score;
+            fused.push_back(std::move(result));
+        }
+
+        // Sort by RRF score descending
+        std::sort(fused.begin(), fused.end(),
+            [](const auto& a, const auto& b) {
+                return a.confidenceScore > b.confidenceScore;
+            });
+
+        return fused;
     }
 
     // ─────────────────────────────────────────────────────────────────────

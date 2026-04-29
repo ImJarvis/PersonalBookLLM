@@ -1,5 +1,6 @@
 #include "Infrastructure/Indexing/SqliteFts5Indexer.h"
 #include "Core/Enums/NodeType.h"
+#include "Core/Log.h"
 #include <sstream>
 
 namespace LocalNotebookLLM::Infrastructure {
@@ -141,7 +142,7 @@ namespace LocalNotebookLLM::Infrastructure {
         if (candidates.empty()) return;
 
         // Group short texts (Semantic Chunk Aggregation) or batch them
-        const size_t BATCH_SIZE = 64; 
+        const size_t BATCH_SIZE = 8; 
         int totalProcessed = 0;
         int totalCount = static_cast<int>(candidates.size());
 
@@ -166,7 +167,7 @@ namespace LocalNotebookLLM::Infrastructure {
                 }
                 tx.Commit();
             } else {
-               // LOG_ERROR("SqliteFts5Indexer", "EmbedBatch FAILED during background processing: " + embResults.error());
+                LOG_ERROR("SqliteFts5Indexer", "EmbedBatch FAILED during background processing: " + embResults.error());
             }
 
             totalProcessed += static_cast<int>(texts.size());

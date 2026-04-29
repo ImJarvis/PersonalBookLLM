@@ -3,6 +3,11 @@
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
+#include <filesystem>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #ifdef HAS_MUPDF
 extern "C" {
@@ -12,20 +17,74 @@ extern "C" {
 
 namespace LocalNotebookLLM::Infrastructure {
 
+    static const std::filesystem::path& GetDoclingScriptPath() {
+        static std::filesystem::path scriptPath = []() -> std::filesystem::path {
+            std::filesystem::path relativePath = "scripts/run_docling.py";
+            if (std::filesystem::exists(relativePath)) {
+                return std::filesystem::absolute(relativePath);
+            }
+#ifdef _WIN32
+            char buffer[MAX_PATH];
+            if (GetModuleFileNameA(NULL, buffer, MAX_PATH)) {
+                std::filesystem::path dir = std::filesystem::path(buffer).parent_path();
+                for (int i = 0; i < 5 && dir.has_parent_path(); ++i) {
+                    std::filesystem::path candidate = dir / "scripts" / "run_docling.py";
+                    if (std::filesystem::exists(candidate)) {
+                        return candidate;
+                    }
+                    dir = dir.parent_path();
+                }
+            }
+#endif
+            return relativePath; // fallback
+        }();
+        return scriptPath;
+    }
+
     std::expected<std::string, std::string> 
     PdfVlmParser::RunVlmOnImage(const std::filesystem::path& imagePath) const {
-        // Run the python script to process the image via granite-docling
-        std::string pyScript = "scripts/run_docling.py";
-        std::string command = "python " + pyScript + " --image \"" + imagePath.string() + "\" > \"" + imagePath.string() + ".md\"";
+        std::string pyScript = GetDoclingScriptPath().string();
+        std::string mdPath = imagePath.string() + ".md";
         
+        // Use direct process creation on Windows to avoid cmd.exe shell injection
+#ifdef _WIN32
+        std::string cmdArgs = "python \"" + pyScript + "\" --image \"" + imagePath.string() + "\" --output \"" + mdPath + "\"";
+        
+        STARTUPINFOA si;
+        PROCESS_INFORMATION pi;
+        ZeroMemory(&si, sizeof(si));
+        si.cb = sizeof(si);
+        ZeroMemory(&pi, sizeof(pi));
+
+        std::vector<char> cmdBuffer(cmdArgs.begin(), cmdArgs.end());
+        cmdBuffer.push_back('\0');
+
+        LOG_INFO("PdfVlmParser", "Running VLM (Secure): " + cmdArgs);
+
+        if (!CreateProcessA(NULL, cmdBuffer.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            return std::unexpected("VLM CreateProcess failed with error " + std::to_string(GetLastError()));
+        }
+
+        WaitForSingleObject(pi.hProcess, INFINITE);
+
+        DWORD exitCode;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+
+        if (exitCode != 0) {
+            return std::unexpected("VLM subprocess failed with code " + std::to_string(exitCode));
+        }
+#else
+        std::string command = "python \"" + pyScript + "\" --image \"" + imagePath.string() + "\" --output \"" + mdPath + "\"";
         LOG_INFO("PdfVlmParser", "Running VLM: " + command);
         int result = std::system(command.c_str());
-        
         if (result != 0) {
             return std::unexpected("VLM subprocess failed with code " + std::to_string(result));
         }
+#endif
         
-        std::ifstream ifs(imagePath.string() + ".md");
+        std::ifstream ifs(mdPath);
         if (!ifs) {
             return std::unexpected("Failed to read VLM output markdown");
         }
@@ -111,40 +170,86 @@ namespace LocalNotebookLLM::Infrastructure {
         fz_drop_context(ctx);
         
         // Parse the markdown output into DocumentTree via StructureDetector
+        // Split markdown by page boundaries (each page's output is separated by double newlines)
+        // Track the current page number so each block gets the correct page reference.
         std::vector<RawTextBlock> blocks;
-        std::istringstream stream(fullMarkdown);
-        std::string line;
         
-        while (std::getline(stream, line)) {
-            // Trim whitespace
-            line.erase(0, line.find_first_not_of(" \t\r\n"));
-            line.erase(line.find_last_not_of(" \t\r\n") + 1);
-            if (line.empty()) continue;
-
-            RawTextBlock block;
-            block.pageNumber = 1; // Assuming sequential parsing or flatten
-            block.isBold = false;
-            block.fontSize = 10.0f; // BODY_SIZE
-
-            if (line.starts_with("# ")) {
-                block.text = line.substr(2);
-                block.fontSize = 16.0f; // H1_MIN_SIZE
-                block.isBold = true;
-            } else if (line.starts_with("## ")) {
-                block.text = line.substr(3);
-                block.fontSize = 13.0f; // H2_MIN_SIZE
-                block.isBold = true;
-            } else if (line.starts_with("### ")) {
-                block.text = line.substr(4);
-                block.fontSize = 11.5f; // H3_MIN_SIZE
-                block.isBold = true;
-            } else if (line.starts_with("**") && line.ends_with("**")) {
-                block.text = line.substr(2, line.length() - 4);
-                block.isBold = true;
-            } else {
-                block.text = line;
+        // Split fullMarkdown into per-page segments using the "\n\n" separators we added above
+        std::vector<std::pair<int, std::string>> pageSegments;
+        {
+            std::istringstream segStream(fullMarkdown);
+            std::string segment;
+            int currentPage = 1;
+            std::string accumulated;
+            std::string line;
+            while (std::getline(segStream, line)) {
+                if (line.empty() && !accumulated.empty()) {
+                    // Check if this is a page boundary (double blank line)
+                    // Each page's VLM output was separated by "\n\n"
+                    pageSegments.push_back({currentPage, accumulated});
+                    accumulated.clear();
+                    if (currentPage < pageCount) currentPage++;
+                } else if (!line.empty()) {
+                    if (!accumulated.empty()) accumulated += "\n";
+                    accumulated += line;
+                }
             }
-            blocks.push_back(std::move(block));
+            if (!accumulated.empty()) {
+                pageSegments.push_back({currentPage, accumulated});
+            }
+        }
+        
+        // If page splitting didn't work well, fall back to sequential assignment
+        if (pageSegments.empty()) {
+            std::istringstream fallbackStream(fullMarkdown);
+            std::string line;
+            while (std::getline(fallbackStream, line)) {
+                line.erase(0, line.find_first_not_of(" \t\r\n"));
+                line.erase(line.find_last_not_of(" \t\r\n") + 1);
+                if (line.empty()) continue;
+
+                RawTextBlock block;
+                block.pageNumber = 1;
+                block.isBold = false;
+                block.fontSize = 10.0f;
+                block.text = line;
+                blocks.push_back(std::move(block));
+            }
+        } else {
+            for (const auto& [pageNum, content] : pageSegments) {
+                std::istringstream lineStream(content);
+                std::string line;
+                while (std::getline(lineStream, line)) {
+                    line.erase(0, line.find_first_not_of(" \t\r\n"));
+                    line.erase(line.find_last_not_of(" \t\r\n") + 1);
+                    if (line.empty()) continue;
+
+                    RawTextBlock block;
+                    block.pageNumber = pageNum;  // Correct page number from VLM loop
+                    block.isBold = false;
+                    block.fontSize = 10.0f; // BODY_SIZE
+
+                    if (line.starts_with("# ")) {
+                        block.text = line.substr(2);
+                        block.fontSize = 16.0f; // H1_MIN_SIZE
+                        block.isBold = true;
+                    } else if (line.starts_with("## ")) {
+                        block.text = line.substr(3);
+                        block.fontSize = 13.0f; // H2_MIN_SIZE
+                        block.isBold = true;
+                    } else if (line.starts_with("### ")) {
+                        block.text = line.substr(4);
+                        block.fontSize = 11.5f; // H3_MIN_SIZE
+                        block.isBold = true;
+                    } else if (line.starts_with("**") && line.ends_with("**")) {
+                        block.text = line.substr(2, line.length() - 4);
+                        block.isBold = true;
+                    } else {
+                        block.text = line;
+                    }
+                    blocks.push_back(std::move(block));
+                }
+            }
         }
 
         return m_detector.BuildTree(blocks);

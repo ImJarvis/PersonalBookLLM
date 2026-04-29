@@ -187,8 +187,8 @@ namespace LocalNotebookLLM::Application {
 
     void InferenceService::ValidateCitations(Core::CitedAnswer& answer,
                                               const Core::AssembledContext& ctx) {
-        // Extract [Page N] references from the answer text
-        std::regex pageRegex(R"(\[Page\s+(\d+)\])");
+        // Extract [Source: ..., Page N] references from the answer text
+        std::regex pageRegex(R"(\[Source:\s*[^,]+,\s*Page\s+(\d+)\])");
         std::smatch match;
         std::string text = answer.answerText;
         std::set<int> referencedPages;
@@ -197,6 +197,13 @@ namespace LocalNotebookLLM::Application {
         auto end = std::sregex_iterator();
         for (; it != end; ++it) {
             referencedPages.insert(std::stoi((*it)[1].str()));
+        }
+
+        // Also match the simpler [Page N] format for backward compatibility
+        std::regex simplePageRegex(R"(\[Page\s+(\d+)\])");
+        auto it2 = std::sregex_iterator(text.begin(), text.end(), simplePageRegex);
+        for (; it2 != end; ++it2) {
+            referencedPages.insert(std::stoi((*it2)[1].str()));
         }
 
         // Mark citations as verified if they appear in the provided context
@@ -216,6 +223,16 @@ namespace LocalNotebookLLM::Application {
 
         std::ostringstream oss;
 
+        // ─── Strict Grounding Preamble (applies to ALL prompt variants) ───
+        // Constrains the model to only use provided document passages.
+        // Without this, 1.5B–4B models freely interpolate parametric knowledge.
+        oss << "CRITICAL RULES — READ BEFORE ANSWERING:\n"
+            << "1. You MUST ONLY answer using information from the passages below.\n"
+            << "2. If information is not in the passages, respond: "
+            << "'This information is not available in the provided documents.'\n"
+            << "3. For every factual claim, cite the source concisely as [Page N].\n"
+            << "4. NEVER fabricate information not present in the passages.\n\n";
+
         if (intent == Application::QueryIntent::Summation) {
             // Synthesis prompt: demands reasoning and explanation, forbids copy-paste.
             // Key design decisions:
@@ -226,17 +243,15 @@ namespace LocalNotebookLLM::Application {
                 << "Your task is to read the document passages below and produce an intelligent, "
                 << "well-structured explanation of the document's content.\n\n"
                 << "RULES:\n"
-                << "- Do NOT copy or paraphrase sentences from the source text verbatim.\n"
-                << "- Synthesize information across multiple passages into a coherent explanation.\n"
-                << "- Identify the main theme, key arguments, and the overall conclusion.\n"
-                << "- Write in clear, natural prose as if explaining to an intelligent reader.\n"
-                << "- You may note page numbers parenthetically (e.g. 'on page 12') but do not let "
-                << "citations interrupt the flow of explanation.\n\n"
+                << "- Do NOT reproduce passages verbatim.\n"
+                << "- Provide a comprehensive, professional summary of the document.\n"
+                << "- Use clear paragraphs and bullet points where appropriate for readability.\n"
+                << "- Write in a highly professional, informative tone.\n"
+                << "- Cite sources concisely as [Page N] for key claims.\n\n"
                 << ctx.formattedContext
                 << "=== QUESTION ===\n"
                 << query << "\n\n"
-                << "=== YOUR ANALYSIS ===\n"
-                << "Step 1 — Main theme: ";
+                << "=== SUMMARY ===\n";
         }
         else if (intent == Application::QueryIntent::ChapterSummary) {
             // Chapter synthesis: focused explanation of a specific section.
@@ -248,7 +263,8 @@ namespace LocalNotebookLLM::Application {
                 << "- Explain the chapter's central argument, supporting ideas, and conclusions.\n"
                 << "- Write as if explaining the chapter to someone who has not read it.\n"
                 << "- Keep the response structured: briefly state what the chapter is about, "
-                << "then explain its key points, then state what the reader will take away.\n\n"
+                << "then explain its key points, then state what the reader will take away.\n"
+                << "- Cite sources as [Source: filename, Page N] for key claims.\n\n"
                 << ctx.formattedContext
                 << "=== QUESTION ===\n"
                 << query << "\n\n"
@@ -260,9 +276,10 @@ namespace LocalNotebookLLM::Application {
                 << "Use the document passages below to answer the question directly and clearly.\n\n"
                 << "RULES:\n"
                 << "- Answer in your own words — do not quote the source text verbatim.\n"
-                << "- Be specific and concrete. Avoid vague hedging."
+                << "- Be specific and concrete. Avoid vague hedging.\n"
                 << "- If the answer requires connecting ideas from multiple passages, do so explicitly.\n"
-                << "- If the information is not present in the provided passages, say so clearly.\n\n"
+                << "- If the information is not present in the provided passages, say so clearly.\n"
+                << "- Cite sources as [Source: filename, Page N] for each factual claim.\n\n"
                 << ctx.formattedContext
                 << "=== QUESTION ===\n"
                 << query << "\n\n"

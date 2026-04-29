@@ -32,6 +32,7 @@ namespace LocalNotebookLLM::UI {
         std::vector<Core::Citation> citations;
         double      generationTimeMs = 0.0;
         int         sectionsSearched = 0;
+        bool        isHidden = false;
     };
 
     /// Application state for the UI.
@@ -49,6 +50,7 @@ namespace LocalNotebookLLM::UI {
         std::deque<ChatMessage> chatHistory;
         char queryBuffer[1024] = {};
         bool generating = false;
+        bool generationCancelled = false;
         std::string generationStatus;
         std::string streamingAnswer;  // Partial answer during streaming
         std::chrono::steady_clock::time_point lastActivityTime; // Watchdog timer
@@ -156,6 +158,7 @@ namespace LocalNotebookLLM::UI {
         std::future<void> m_workerLoadFuture;
 
         std::mutex m_stateMutex;
+        std::string m_pendingAutoQuery;
 
         void RefreshDocumentList();
         void AutoDetectAndLoadModels();

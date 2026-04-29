@@ -66,6 +66,20 @@ if(LOCALNOTEBOOK_BUILD_LLAMA)
         set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
         set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
         set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+
+        # ─── SIMD: Enable AVX2/FMA/F16C for CPU-only quantized inference ───
+        # These yield 2-3x prompt evaluation speedup on modern Intel/AMD CPUs.
+        # Without them, ggml falls back to scalar C matmul implementations.
+        set(GGML_AVX2    ON CACHE BOOL "Enable AVX2 SIMD" FORCE)
+        set(GGML_FMA     ON CACHE BOOL "Enable FMA" FORCE)
+        set(GGML_F16C    ON CACHE BOOL "Enable F16C" FORCE)
+        
+        # ─── Hardware Acceleration: Enable Vulkan for GPU math ───
+        set(GGML_VULKAN  ON CACHE BOOL "Enable Vulkan" FORCE)
+        # Only enable AVX-512 if target hardware supports it:
+        # set(GGML_AVX512      ON CACHE BOOL "Enable AVX-512" FORCE)
+        # set(GGML_AVX512_VNNI ON CACHE BOOL "Enable AVX-512 VNNI" FORCE)
+
         add_subdirectory(external/llama.cpp EXCLUDE_FROM_ALL)
     else()
         # Auto-download via FetchContent
@@ -80,6 +94,14 @@ if(LOCALNOTEBOOK_BUILD_LLAMA)
         set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
         set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
         set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+
+        # ─── SIMD: Enable AVX2/FMA/F16C for CPU-only quantized inference ───
+        set(GGML_AVX2    ON CACHE BOOL "Enable AVX2 SIMD" FORCE)
+        set(GGML_FMA     ON CACHE BOOL "Enable FMA" FORCE)
+        set(GGML_F16C    ON CACHE BOOL "Enable F16C" FORCE)
+        
+        # ─── Hardware Acceleration: Enable Vulkan for GPU math ───
+        set(GGML_VULKAN  ON CACHE BOOL "Enable Vulkan" FORCE)
         
         # Workaround for ggml's ASM requirement on MSVC + Ninja
         if(WIN32 AND CMAKE_GENERATOR MATCHES "Ninja")

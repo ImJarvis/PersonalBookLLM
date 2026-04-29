@@ -55,6 +55,15 @@ namespace LocalNotebookLLM::Infrastructure {
         [[nodiscard]]
         static std::vector<Core::HybridSearchResult>
         TakeTop(std::vector<Core::HybridSearchResult>& results, int n);
+
+        /// Reciprocal Rank Fusion: combines results from all 3 tiers into a single
+        /// ranked list using RRF_score(doc) = Σ 1/(k + rank_in_tier_i).
+        [[nodiscard]]
+        static std::vector<Core::HybridSearchResult>
+        FuseWithRRF(const std::vector<Core::HybridSearchResult>& bm25,
+                    const std::vector<Core::HybridSearchResult>& structural,
+                    const std::vector<Core::HybridSearchResult>& semantic,
+                    int k = 60);
     };
 
 } // namespace LocalNotebookLLM::Infrastructure

@@ -15,7 +15,9 @@ namespace LocalNotebookLLM::Application {
 
     std::string ContextAssembler::FormatSourceBlock(const Core::SearchResult& result) {
         std::ostringstream oss;
-        oss << "[Page " << result.pageNumber << "]";
+        // Format: [Source: filename, Page N] — enables multi-document citation tracking
+        std::string sourceName = result.documentName.empty() ? "document" : result.documentName;
+        oss << "[Source: " << sourceName << ", Page " << result.pageNumber << "]";
         if (!result.sectionPath.empty() && result.sectionPath != "Document Root") {
             oss << " — " << result.sectionPath;
         }
@@ -48,6 +50,7 @@ namespace LocalNotebookLLM::Application {
         contextStream
             << "=== DOCUMENT CONTENT ===\n"
             << "The following passages are extracted from the document in reading order.\n"
+            << "Each passage is tagged with [Source: filename, Page N] for citation.\n"
             << "Read them carefully and use them to answer the question.\n\n";
 
         usedTokens += m_estimator(contextStream.str());

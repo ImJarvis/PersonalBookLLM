@@ -36,7 +36,18 @@
       ]
     },
     {
-      "name": "freetype"
+      "name": "freetype",
+      "default-features": false,
+      "features": [
+        "zlib",
+        "png"
+      ]
+    },
+    {
+      "name": "vulkan"
+    },
+    {
+      "name": "shaderc"
     }
   ],
   "builtin-baseline": "77df67cfff9c12ccfdb52284e07c87c75092f723"

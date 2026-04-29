@@ -63,7 +63,10 @@ namespace LocalNotebookLLM::Infrastructure {
         }
 
         auto mparams = llama_model_default_params();
-        mparams.n_gpu_layers = 99; // Try fully offloading embedding model to GPU (usually small enough)
+        // Auto-detect GPU: try full offload if GPU available, otherwise CPU-only.
+        // On CPU-only 8GB machines, n_gpu_layers=99 silently falls back to 0
+        // but wastes the GPU detection attempt.
+        mparams.n_gpu_layers = 99; // llama.cpp safely clamps to 0 when no GPU present
 
         m_impl->model = llama_model_load_from_file(modelPath.string().c_str(), mparams);
         if (!m_impl->model) {
@@ -75,7 +78,13 @@ namespace LocalNotebookLLM::Infrastructure {
         auto cparams = llama_context_default_params();
         cparams.n_ctx = 8192; // Max sum of batch tokens allowed
         cparams.n_batch = 8192; // Match batch evaluation block max to ctx
-        cparams.n_threads = 4;
+        cparams.n_ubatch = 8192; // Match physical batch block max to prevent decode failures
+        cparams.n_seq_max = 128; // CRITICAL: Allow up to 128 simultaneous sequence IDs in the KV cache
+        // Thread count: balance between throughput and OS responsiveness.
+        // For hyper-threaded CPUs > 4 logical cores, use physical cores (logical / 2).
+        // For CPUs <= 4 logical cores, use logical cores - 1 (leave 1 for OS).
+        int logicalCores = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+        cparams.n_threads = (logicalCores <= 4) ? std::max(1, logicalCores - 1) : (logicalCores / 2);
         cparams.embeddings = true; // Crucial: explicitly enable embeddings mode
 
         m_impl->ctx = llama_init_from_model(m_impl->model, cparams);
@@ -215,37 +224,87 @@ namespace LocalNotebookLLM::Infrastructure {
             return std::unexpected("Total batch tokens exceed context window");
         }
 
-        llama_batch batch = llama_batch_init(total_tokens, 0, static_cast<int32_t>(texts.size()));
-        for (size_t seq = 0; seq < all_tokens.size(); ++seq) {
-            const auto& toks = all_tokens[seq];
-            for (size_t i = 0; i < toks.size(); i++) {
-                llama_batch_add(batch, toks[i], static_cast<llama_pos>(i), {static_cast<llama_seq_id>(seq)}, i == toks.size() - 1);
+        // ─── Local Gold Standard: Paged Batch Chunking ───
+        // We pack tokens from multiple sequences into strict 512-token physical blocks
+        LOG_INFO("LlamaCppEmbed", "Starting Paged Batch evaluation for " + std::to_string(texts.size()) + 
+                 " sequences (" + std::to_string(total_tokens) + " total tokens)");
+                 
+        int32_t batch_size = 512; // Strictly enforce hardware-safe blocks
+        llama_batch batch = llama_batch_init(batch_size, 0, static_cast<int32_t>(texts.size()));
+        
+        std::vector<size_t> seq_pos(texts.size(), 0);
+        bool all_done = false;
+        int chunk_idx = 0;
+        
+        while (!all_done) {
+            all_done = true;
+            batch.n_tokens = 0;
+            std::vector<bool> seq_finished_in_chunk(texts.size(), false);
+            
+            // Fill the physical block across all active sequences
+            for (size_t seq = 0; seq < texts.size(); ++seq) {
+                const auto& toks = all_tokens[seq];
+                while (seq_pos[seq] < toks.size() && batch.n_tokens < batch_size) {
+                    all_done = false;
+                    bool is_last = (seq_pos[seq] == toks.size() - 1);
+                    
+                    batch.token[batch.n_tokens] = toks[seq_pos[seq]];
+                    batch.pos[batch.n_tokens] = static_cast<llama_pos>(seq_pos[seq]);
+                    batch.n_seq_id[batch.n_tokens] = 1;
+                    batch.seq_id[batch.n_tokens][0] = static_cast<llama_seq_id>(seq);
+                    batch.logits[batch.n_tokens] = is_last ? 1 : 0;
+                    batch.n_tokens++;
+                    
+                    if (is_last) {
+                        seq_finished_in_chunk[seq] = true;
+                    }
+                    
+                    seq_pos[seq]++;
+                }
+                if (batch.n_tokens >= batch_size) {
+                    all_done = false;
+                    break;
+                }
             }
-        }
-
-        if (llama_decode(m_impl->ctx, batch) != 0) {
-            llama_batch_free(batch);
-            return std::unexpected("Failed to decode token batch for embeddings");
+            
+            if (batch.n_tokens > 0) {
+                LOG_DEBUG("LlamaCppEmbed", "Evaluating chunk " + std::to_string(++chunk_idx) + 
+                          " with " + std::to_string(batch.n_tokens) + " tokens...");
+                          
+                if (llama_decode(m_impl->ctx, batch) != 0) {
+                    LOG_ERROR("LlamaCppEmbed", "llama_decode failed at chunk " + std::to_string(chunk_idx) + 
+                              " (batch size: " + std::to_string(batch.n_tokens) + "). Memory limit exceeded.");
+                    llama_batch_free(batch);
+                    return std::unexpected("Paged batch decoding failed due to hardware limits");
+                }
+                
+                // CRITICAL FIX: Extract embeddings IMMEDIATELY for sequences that finished in this chunk.
+                // llama_decode overwrites the embedding buffer in subsequent calls, so we must pull them out now!
+                for (size_t seq = 0; seq < texts.size(); ++seq) {
+                    if (seq_finished_in_chunk[seq]) {
+                        const float* embd = llama_get_embeddings_seq(m_impl->ctx, static_cast<llama_seq_id>(seq));
+                        if (!embd) {
+                            llama_batch_free(batch);
+                            return std::unexpected("Model did not return embedding vector for seq " + std::to_string(seq) + " in chunk " + std::to_string(chunk_idx));
+                        }
+                        
+                        std::vector<float> res(embd, embd + m_impl->dimensions);
+                        
+                        // L2 Normalize the vector for cosine similarity optimization
+                        float sum = 0.0f;
+                        for (float v : res) sum += v * v;
+                        if (sum > 0.0f) {
+                            float norm = std::sqrt(sum);
+                            for (float& v : res) v /= norm;
+                        }
+                        
+                        results[seq] = std::move(res);
+                    }
+                }
+            }
         }
         llama_batch_free(batch);
-
-        for (size_t seq = 0; seq < texts.size(); ++seq) {
-            const float* embd = llama_get_embeddings_seq(m_impl->ctx, static_cast<llama_seq_id>(seq));
-            if (!embd) {
-                // Fallback attempt (unlikely if sequential embeddings enabled natively)
-                return std::unexpected("Model did not return embedding vector for seq " + std::to_string(seq));
-            }
-            
-            std::vector<float> res(embd, embd + m_impl->dimensions);
-            
-            float sum = 0.0f;
-            for (float v : res) sum += v * v;
-            if (sum > 0.0f) {
-                float norm = std::sqrt(sum);
-                for (float& v : res) v /= norm;
-            }
-            results[seq] = std::move(res);
-        }
+        LOG_INFO("LlamaCppEmbed", "Paged Batch evaluation complete in " + std::to_string(chunk_idx) + " chunks. Extracted all vectors.");
 
         return results;
 #else

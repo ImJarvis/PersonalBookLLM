@@ -55,6 +55,7 @@ namespace LocalNotebookLLM::UI {
                     ImGui::PopStyleColor();
                 } else {
                     for (size_t i = 0; i < state.chatHistory.size(); ++i) {
+                        if (state.chatHistory[i].isHidden) continue;
                         RenderMessage(state.chatHistory[i], static_cast<int>(i));
                     }
 
@@ -92,13 +93,17 @@ namespace LocalNotebookLLM::UI {
                             if (availW > cancelW + 10) {
                                 ImGui::SameLine(ImGui::GetCursorPosX() + availW - cancelW);
                             }
-                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.12f, 0.12f, 0.9f));
-                            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.7f, 0.18f, 0.18f, 1.0f));
-                            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.9f, 0.2f, 0.2f, 1.0f));
-                            if (ImGui::SmallButton("Cancel")) {
-                                app.CancelGeneration();
+                            if (state.generationCancelled) {
+                                ImGui::TextColored(ThemeColors::TextSecondary, "Cancelling...");
+                            } else {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.12f, 0.12f, 0.9f));
+                                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.7f, 0.18f, 0.18f, 1.0f));
+                                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.9f, 0.2f, 0.2f, 1.0f));
+                                if (ImGui::SmallButton("Cancel")) {
+                                    app.CancelGeneration();
+                                }
+                                ImGui::PopStyleColor(3);
                             }
-                            ImGui::PopStyleColor(3);
                         }
                         ImGui::Spacing();
 
@@ -235,6 +240,96 @@ namespace LocalNotebookLLM::UI {
             }
         }
 
+        // ─── Custom Markdown & Wrapped Text Renderer ──────────────────────────────
+        static void RenderMarkdown(const std::string& text) {
+            float start_x = ImGui::GetCursorPosX();
+            float wrap_width = start_x + ImGui::GetContentRegionAvail().x;
+            
+            bool in_bold = false;
+            float oldSpacing = ImGui::GetStyle().ItemSpacing.y;
+            ImGui::GetStyle().ItemSpacing.y = 8.0f; // Add breathing room between paragraphs
+            
+            auto renderWord = [&](const std::string& word, bool isBold, bool isCitation, bool hasSpaceAfter) {
+                if (word.empty()) return;
+                ImVec2 textSize = ImGui::CalcTextSize(word.c_str());
+                if (ImGui::GetCursorPosX() + textSize.x > wrap_width && ImGui::GetCursorPosX() > start_x) {
+                    ImGui::NewLine();
+                    ImGui::SetCursorPosX(start_x);
+                }
+                
+                ImVec4 color = ThemeColors::TextPrimary;
+                if (isBold) color = ImVec4(1.0f, 1.0f, 1.0f, 1.0f); // Bright white for bold
+                if (isCitation) color = ThemeColors::AccentBlue;
+
+                ImVec2 p_min = ImGui::GetCursorScreenPos();
+                ImGui::TextColored(color, "%s", word.c_str());
+                ImVec2 p_max = ImVec2(p_min.x + textSize.x, p_min.y + textSize.y);
+                
+                if (isCitation) {
+                    // Underline
+                    ImGui::GetWindowDrawList()->AddLine(
+                        ImVec2(p_min.x, p_max.y), ImVec2(p_max.x, p_max.y),
+                        ImGui::ColorConvertFloat4ToU32(color), 1.0f);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                        ImGui::SetTooltip("Citation reference");
+                    }
+                }
+                
+                ImGui::SameLine(0, 0);
+                if (hasSpaceAfter) {
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::CalcTextSize(" ").x);
+                }
+            };
+
+            size_t i = 0;
+            while (i < text.size()) {
+                if (text[i] == '\n') {
+                    ImGui::NewLine();
+                    if (i + 1 < text.size() && text[i+1] == '\n') {
+                        ImGui::Spacing();
+                        i++;
+                    }
+                    ImGui::SetCursorPosX(start_x);
+                    i++;
+                    continue;
+                }
+                
+                if (text[i] == '*' && i + 1 < text.size() && text[i+1] == '*') {
+                    in_bold = !in_bold;
+                    i += 2;
+                    continue;
+                }
+                
+                std::string word;
+                bool isCitation = false;
+                if (text[i] == '[') {
+                    size_t end = text.find(']', i);
+                    if (end != std::string::npos) {
+                        word = text.substr(i, end - i + 1);
+                        isCitation = true;
+                        i = end + 1;
+                    } else {
+                        word += text[i++];
+                    }
+                } else {
+                    while (i < text.size() && text[i] != ' ' && text[i] != '\n' && text[i] != '[' && !(text[i] == '*' && i+1 < text.size() && text[i+1] == '*')) {
+                        word += text[i++];
+                    }
+                }
+                
+                bool hasSpace = false;
+                if (i < text.size() && text[i] == ' ') {
+                    hasSpace = true;
+                    while(i < text.size() && text[i] == ' ') i++; // skip multiple spaces
+                }
+                
+                renderWord(word, in_bold, isCitation, hasSpace);
+            }
+            ImGui::NewLine();
+            ImGui::GetStyle().ItemSpacing.y = oldSpacing;
+        }
+
         // ─── Message bubble ───────────────────────────────────────────────────────
         static void RenderMessage(const ChatMessage& msg, int index) {
             ImGui::PushID(index);
@@ -267,22 +362,24 @@ namespace LocalNotebookLLM::UI {
 
             ImGui::TextColored(roleColor, "%s", roleLabel);
 
-            if (msg.role == ChatMessage::Role::Assistant && msg.generationTimeMs > 0) {
-                ImGui::SameLine();
-                ImGui::TextColored(ThemeColors::TextSecondary, "| %.1fs | %d sources",
-                    msg.generationTimeMs / 1000.0, msg.sectionsSearched);
-            }
-
-            ImGui::TextWrapped("%s", msg.text.c_str());
-
-            if (!msg.citations.empty()) {
-                ImGui::Spacing();
-                ImGui::TextColored(ThemeColors::TextSecondary, "Sources:");
-                for (const auto& cite : msg.citations) {
-                    ImGui::BulletText("Page %d \xe2\x80\x94 %s", cite.pageNumber,
-                                      cite.sectionPath.c_str());
+            if (msg.role == ChatMessage::Role::Assistant) {
+                if (msg.generationTimeMs > 0) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(ThemeColors::TextSecondary, "| %.1fs | %d sources",
+                        msg.generationTimeMs / 1000.0, msg.sectionsSearched);
+                }
+                
+                // Copy Button
+                ImGui::SameLine(ImGui::GetContentRegionAvail().x - 50.0f);
+                if (ImGui::Button("Copy", ImVec2(50, 0))) {
+                    ImGui::SetClipboardText(msg.text.c_str());
                 }
             }
+
+            ImGui::Spacing();
+            
+            // Render text with improved paragraph spacing to reduce density
+            RenderMarkdown(msg.text);
 
             ImGui::EndChild();
             ImGui::PopStyleColor();

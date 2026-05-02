@@ -3,6 +3,7 @@
 #include "Application/InferenceService.h"
 #include "Core/Models/DocumentMetadata.h"
 #include "Core/Models/CitedAnswer.h"
+#include "Infrastructure/Search/HybridSearchEngine.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -94,7 +95,10 @@ namespace LocalNotebookLLM::UI {
         ~App();
 
         /// Initialize all services (call once at startup).
-        bool Initialize(const std::filesystem::path& dataDir);
+        /// @param freshSession  When true, wipes the existing database before opening,
+        ///                      giving a clean slate (useful for tests or --fresh-session CLI).
+        ///                      Defaults to false so that documents persist across launches.
+        bool Initialize(const std::filesystem::path& dataDir, bool freshSession = false);
 
         /// Get mutable state for UI rendering.
         AppState& GetState() { return m_state; }
@@ -148,7 +152,8 @@ namespace LocalNotebookLLM::UI {
         std::shared_ptr<Infrastructure::MemoryOrchestrator> m_memoryOrch;
 
         // Shared infrastructure (kept alive for service lifetime)
-        std::shared_ptr<Infrastructure::DatabaseManager> m_db;
+        std::shared_ptr<Infrastructure::DatabaseManager>    m_db;
+        std::shared_ptr<Infrastructure::HybridSearchEngine> m_searchEngine;
 
         // Async futures
         std::future<void> m_ingestionFuture;

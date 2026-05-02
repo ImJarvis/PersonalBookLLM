@@ -97,13 +97,23 @@ namespace LocalNotebookLLM::Core {
                    << " [" << lvl << "]"
                    << " [" << component << "] "
                    << message << "\n";
-            m_file.flush();
+            // M4: Tiered flush strategy —
+            //   Error → immediate flush (visibility for crashes)
+            //   Others → periodic flush every 50 writes (~1 disk sync per 500ms during
+            //   embedding/inference). Keeps throughput high while guaranteeing log
+            //   entries appear in the file before a session ends or crashes.
+            if (level >= LogLevel::Error) {
+                m_file.flush();
+            } else if (++m_writeCount % 50 == 0) {
+                m_file.flush();
+            }
         }
 
         std::ofstream m_file;
         std::mutex    m_mutex;
         LogLevel      m_minLevel    = LogLevel::Debug;
         bool          m_initialized = false;
+        size_t        m_writeCount  = 0;   // For periodic flush (every 50 writes)
     };
 
 } // namespace LocalNotebookLLM::Core

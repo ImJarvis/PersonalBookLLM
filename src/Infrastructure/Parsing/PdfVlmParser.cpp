@@ -65,7 +65,16 @@ namespace LocalNotebookLLM::Infrastructure {
             return std::unexpected("VLM CreateProcess failed with error " + std::to_string(GetLastError()));
         }
 
-        WaitForSingleObject(pi.hProcess, INFINITE);
+        // H2: 5-minute hard timeout — prevents infinite hang if Python crashes or GPU OOMs.
+        constexpr DWORD VLM_TIMEOUT_MS = 300'000; // 5 minutes
+        DWORD waitResult = WaitForSingleObject(pi.hProcess, VLM_TIMEOUT_MS);
+        if (waitResult == WAIT_TIMEOUT) {
+            LOG_ERROR("PdfVlmParser", "VLM subprocess timed out after 5 minutes — killing process");
+            TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            return std::unexpected("VLM process timed out after 5 minutes");
+        }
 
         DWORD exitCode;
         GetExitCodeProcess(pi.hProcess, &exitCode);
@@ -162,8 +171,11 @@ namespace LocalNotebookLLM::Infrastructure {
                 LOG_WARN("PdfVlmParser", "VLM failed on page " + std::to_string(i) + ": " + mdResult.error());
             }
             
-            std::filesystem::remove(tempImgPath);
-            std::filesystem::remove(tempImgPath + ".md");
+            // L5: Use error_code overloads — never throws if files don't exist
+            // (e.g. when VLM failed before writing the .md output file).
+            std::error_code removeEc;
+            std::filesystem::remove(tempImgPath, removeEc);
+            std::filesystem::remove(tempImgPath + ".md", removeEc);
         }
 
         fz_drop_document(ctx, doc);

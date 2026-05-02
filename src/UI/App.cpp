@@ -82,7 +82,7 @@ App::~App() {
   LOG_DEBUG("App", "App destructor — all threads joined, resources destroyed");
 }
 
-bool App::Initialize(const std::filesystem::path &dataDir) {
+bool App::Initialize(const std::filesystem::path& dataDir, bool freshSession) {
   LOG_INFO("App", "=== Initialize() begin ===");
   m_dataDir = dataDir;
   m_modelsDir = std::filesystem::path(LOCALNOTEBOOK_MODELS_DIR);
@@ -94,6 +94,7 @@ bool App::Initialize(const std::filesystem::path &dataDir) {
 
   LOG_INFO("App", "Data dir:   " + m_dataDir.string());
   LOG_INFO("App", "Models dir: " + m_modelsDir.string());
+  LOG_INFO("App", std::string("Fresh session: ") + (freshSession ? "YES" : "NO (persistent)"));
 
   // Ensure directories exist
   std::filesystem::create_directories(m_dataDir);
@@ -102,12 +103,15 @@ bool App::Initialize(const std::filesystem::path &dataDir) {
   // ─── Wire up infrastructure (Dependency Injection) ───
   std::string dbPath = (m_dataDir / "notebook.db").string();
 
-  // Wipe existing database for a clean state each session
-  std::error_code ec;
-  std::filesystem::remove(dbPath, ec);
-  std::filesystem::remove(dbPath + "-wal", ec);
-  std::filesystem::remove(dbPath + "-shm", ec);
-  LOG_INFO("App", "Cleaned previous database state");
+  // Only wipe when explicitly requested (e.g. test runs, --fresh-session CLI flag).
+  // Default: retain previously ingested documents across sessions.
+  if (freshSession) {
+    std::error_code ec;
+    std::filesystem::remove(dbPath, ec);
+    std::filesystem::remove(dbPath + "-wal", ec);
+    std::filesystem::remove(dbPath + "-shm", ec);
+    LOG_INFO("App", "Fresh session — cleared previous database state");
+  }
 
   LOG_INFO("App", "Opening database: " + dbPath);
   m_db = std::make_shared<Infrastructure::DatabaseManager>(dbPath);
@@ -182,7 +186,7 @@ bool App::Initialize(const std::filesystem::path &dataDir) {
 
   // ─── Search engine (BM25 + Structural navigation) ───
   auto navigator = std::make_shared<Infrastructure::StructuralNavigator>(m_db);
-  auto search = std::make_shared<Infrastructure::HybridSearchEngine>(
+  m_searchEngine = std::make_shared<Infrastructure::HybridSearchEngine>(
       indexer, navigator, m_embedder, m_db);
   LOG_INFO("App", "HybridSearchEngine created (BM25 + Structural + Semantic)");
 
@@ -191,7 +195,7 @@ bool App::Initialize(const std::filesystem::path &dataDir) {
 
   // ─── InferenceService (uses Reasoner for Q&A) ───
   m_inferService = std::make_unique<Application::InferenceService>(
-      m_reasonerLLM, search, std::move(assembler), m_memoryOrch);
+      m_reasonerLLM, m_searchEngine, std::move(assembler), m_memoryOrch);
   LOG_INFO("App", "InferenceService created");
 
   // Load initial state
@@ -415,15 +419,20 @@ void App::IngestDocument(const std::filesystem::path &filePath) {
           "An unknown fatal error occurred during ingestion.";
     }
 
+    // M1: Invalidate embedding cache so next search sees new embeddings
+    if (m_searchEngine) m_searchEngine->InvalidateCache();
+    // M6: Run SQL outside the lock
+    auto freshDocs = m_docService->ListDocuments();
     std::lock_guard finalLock(m_stateMutex);
     m_state.ingesting = false;
-    RefreshDocumentList();
+    m_state.documents = std::move(freshDocs);
   });
 }
 
 void App::RemoveDocument(int64_t docId) {
   LOG_INFO("App", "RemoveDocument() id=" + std::to_string(docId));
   m_docService->RemoveDocument(docId);
+  if (m_searchEngine) m_searchEngine->InvalidateCache(); // Evict stale entries
   RefreshDocumentList();
 }
 
@@ -730,7 +739,7 @@ void App::CancelGeneration() {
   // NOTE: We do NOT set generating=false here.  The async thread will
   // do that when it finishes (which should be within a few hundred ms
   // now that the cancellation flag is set).  If the thread truly hangs
-  // past the next watchdog cycle (another 90s), we escalate to the
+  // past the next watchdog cycle (another 10 min), we escalate to the
   // nuclear option: abandon the future and rebuild the provider.
 }
 

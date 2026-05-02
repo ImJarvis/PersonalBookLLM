@@ -299,19 +299,32 @@ namespace LocalNotebookLLM::Infrastructure {
     }
 
     std::string SqliteFts5Indexer::EscapeFts5Query(const std::string& query) {
-        // Wrap each token in quotes to prevent FTS5 syntax errors from special chars
+        // Wrap each token in double-quotes to prevent FTS5 syntax errors
+        // from special characters like hyphens and parentheses.
         std::istringstream stream(query);
         std::string word;
-        std::string escaped;
+        std::vector<std::string> terms;
 
         while (stream >> word) {
-            // Strip dangerous FTS5 operators
+            // Lowercase FTS5 boolean operators so they become plain search terms
             if (word == "AND" || word == "OR" || word == "NOT" || word == "NEAR") {
-                // Lowercase them to use as regular search terms
-                for (auto& c : word) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                for (auto& c : word)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             }
-            if (!escaped.empty()) escaped += " OR ";
-            escaped += "\"" + word + "\"";
+            terms.push_back('"' + word + '"');
+        }
+
+        if (terms.empty()) return {};
+
+        // ── Precision strategy ──
+        // Multi-word queries: implicit FTS5 AND (space-separated quoted terms).
+        //   "machine learning" → "machine" "learning" — both must be present.
+        //   This avoids flooding results with documents matching any single token.
+        // Single-word queries: return as-is (implicit AND is identical to OR for 1 term).
+        std::string escaped;
+        for (size_t i = 0; i < terms.size(); ++i) {
+            if (i > 0) escaped += ' ';
+            escaped += terms[i];
         }
         return escaped;
     }

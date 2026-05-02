@@ -37,6 +37,12 @@ namespace LocalNotebookLLM::Infrastructure {
         m_embeddingModelPath = path;
     }
 
+    void MemoryOrchestrator::SetProtectEmbedding(bool protect) {
+        std::lock_guard lock(m_mutex);
+        m_protectEmbedding = protect;
+        LOG_INFO("MemOrch", std::string("Embedding protection: ") + (protect ? "ON" : "OFF"));
+    }
+
     std::expected<void, std::string>
     MemoryOrchestrator::RequestModel(Core::ModelRole role) {
         std::lock_guard lock(m_mutex);
@@ -79,12 +85,18 @@ namespace LocalNotebookLLM::Infrastructure {
                     return {};
                 }
 
-                LOG_INFO("MemOrch", "  Evicting Worker + Embedding for Reasoner");
+                LOG_INFO("MemOrch", "  Evicting Worker for Reasoner");
                 if (m_workerProvider->IsModelLoaded()) {
                     m_workerProvider->UnloadModel();
                 }
-                if (m_embeddingProvider && m_embeddingProvider->IsLoaded()) {
+                // Only evict embedding if it is not explicitly protected.
+                // During active document ingestion, the embedding model must stay
+                // loaded to avoid a full cold-reload (100MB) per ingestion call.
+                if (m_embeddingProvider && m_embeddingProvider->IsLoaded() && !m_protectEmbedding) {
+                    LOG_INFO("MemOrch", "  Evicting Embedding for Reasoner (not protected)");
                     m_embeddingProvider->Unload();
+                } else if (m_embeddingProvider && m_embeddingProvider->IsLoaded()) {
+                    LOG_INFO("MemOrch", "  Embedding model protected — keeping in memory");
                 }
 
                 if (m_reasonerConfig.modelPath.empty()) {

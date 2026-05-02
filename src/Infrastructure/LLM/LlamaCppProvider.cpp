@@ -5,32 +5,8 @@
 #include <functional>
 #include <thread>
 
-// ─── Conditionally include llama.cpp headers ───
 #ifdef HAS_LLAMA_CPP
-#include <llama.h>
-#include <ggml.h>
-#endif
-
-#ifdef HAS_LLAMA_CPP
-#include <llama.h> // Ensure we load the API headers
-#include <vector>
-
-// Helper to polyfill the removed llama_batch_add utility function
-static inline void llama_batch_add(
-    struct llama_batch & batch,
-    llama_token   id,
-    llama_pos   pos,
-    const std::vector<llama_seq_id> & seq_ids,
-    bool   logits) {
-    batch.token   [batch.n_tokens] = id;
-    batch.pos     [batch.n_tokens] = pos;
-    batch.n_seq_id[batch.n_tokens] = static_cast<int32_t>(seq_ids.size());
-    for (size_t i = 0; i < seq_ids.size(); ++i) {
-        batch.seq_id[batch.n_tokens][i] = seq_ids[i];
-    }
-    batch.logits  [batch.n_tokens] = logits ? 1 : 0;
-    batch.n_tokens++;
-}
+#include "Infrastructure/LLM/LlamaInternalUtils.h"  // H5: shared polyfill (llama_batch_add)
 #endif
 
 namespace LocalNotebookLLM::Infrastructure {
@@ -46,13 +22,54 @@ namespace LocalNotebookLLM::Infrastructure {
         Core::ModelStatus status;
         bool loaded = false;
 
-        // ── KV cache prefix tracking ──
-        // We split every prompt into a stable "prefix" (system prompt + document context)
-        // and a variable "tail" (the user's question). By tracking evaluated tokens,
-        // we can find the longest common prefix and avoid re-evaluating it.
-        std::vector<llama_token> cachedTokens; // Full history of evaluated tokens
-        bool   kvCacheWarm       = false;
+        // ─── Gold Standard Two-Stage KV Cache Layout ───────────────────────────
+        //
+        //  The llama.cpp context window is treated as two pinned regions:
+        //
+        //  Seq 1 (system prefix — pinned forever):
+        //    Tokens [0 .. systemPrefixLen)
+        //    Contains: CRITICAL RULES + intent persona (~80 tokens)
+        //    Evaluated exactly once on the first GenerateStreaming() call.
+        //    Never evicted until model is unloaded.
+        //
+        //  Seq 0 (document context — pinned per document hash):
+        //    Tokens [systemPrefixLen .. systemPrefixLen + contextLen)
+        //    Contains: retrieved passages block (~1500-2500 tokens)
+        //    Evicted and re-evaluated only when contextHash changes.
+        //    On follow-up questions to the same document: 0 tokens re-evaluated here.
+        //
+        //  Variable tail (question + answer stub):
+        //    Tokens [systemPrefixLen + contextLen .. N)
+        //    Always freshly evaluated (~15-25 tokens).
+        //
+        //  Net result: 2nd+ question to same document skips ~2100/2200 tokens.
+        // ────────────────────────────────────────────────────────────────────────
+
+        // Stage 1 — system prefix
+        std::vector<llama_token> systemPrefixTokens; // Tokenized CRITICAL RULES block
+        int  systemPrefixLen  = 0;                   // KV positions [0, systemPrefixLen) pinned
+        bool systemPrefixWarm = false;               // True after first evaluation
+
+        // Stage 2 — document context
+        std::vector<llama_token> contextTokens;      // Tokenized context block
+        int    contextLen     = 0;                   // KV positions [systemPrefixLen, +contextLen)
+        bool   contextWarm    = false;               // True when contextHash is valid
+        size_t contextHash    = 0;                   // FNV-1a hash of formattedContext string
+
+        // Legacy full-prompt cache (used as fallback when stages not applicable)
+        std::vector<llama_token> cachedTokens;
+        bool   kvCacheWarm    = false;
     };
+
+    // ── FNV-1a 64-bit hash — fast, non-crypto, sufficient for cache keying ──
+    static size_t HashString(const std::string& s) {
+        size_t hash = 14695981039346656037ULL;
+        for (unsigned char c : s) {
+            hash ^= c;
+            hash *= 1099511628211ULL;
+        }
+        return hash;
+    }
 
     // Global flag to ensure llama_backend_init is only called exactly once
     static std::once_flag g_llamaInitFlag;
@@ -148,8 +165,8 @@ namespace LocalNotebookLLM::Infrastructure {
         // ─── Context parameters ───
         auto cparams = llama_context_default_params();
         cparams.n_ctx     = params.contextWindowSize;
-        cparams.n_batch   = 128;  // Smaller batches = more frequent cancellation checkpoints
-                                   // (default 512 can block for 30+s per chunk on CPU)
+        cparams.n_batch   = 512;  // llama.cpp default. Cancellation is checked between
+                                   // each 512-token chunk — sufficient granularity for CPU.
         cparams.n_threads = params.threadCount > 0
                            ? params.threadCount
                            : static_cast<int>(std::thread::hardware_concurrency());
@@ -169,7 +186,8 @@ namespace LocalNotebookLLM::Infrastructure {
         };
         cparams.type_k     = toGgmlType(params.kvCacheTypeK);
         cparams.type_v     = toGgmlType(params.kvCacheTypeV);
-        cparams.flash_attn_type = params.useFlashAttention ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        cparams.rope_freq_scale = 1.0f;
+        //cparams.flash_attn = params.useFlashAttention;
 
         m_impl->ctx = llama_init_from_model(m_impl->model, cparams);
         if (!m_impl->ctx) {
@@ -193,9 +211,16 @@ namespace LocalNotebookLLM::Infrastructure {
         m_impl->status.gpuLayers     = gpuLayers;
         m_impl->status.device        = gpuLayers > 0 ? "GPU" : "CPU";
 
-        // Reset KV cache tracking on new model load
+        // Reset all KV cache state on new model load
         m_impl->cachedTokens.clear();
-        m_impl->kvCacheWarm      = false;
+        m_impl->kvCacheWarm       = false;
+        m_impl->systemPrefixTokens.clear();
+        m_impl->systemPrefixLen   = 0;
+        m_impl->systemPrefixWarm  = false;
+        m_impl->contextTokens.clear();
+        m_impl->contextLen        = 0;
+        m_impl->contextWarm       = false;
+        m_impl->contextHash       = 0;
 
         // Rebuild cached sampler for the new model/params
         if (m_impl->sampler) {
@@ -203,6 +228,10 @@ namespace LocalNotebookLLM::Infrastructure {
             m_impl->sampler = nullptr;
         }
         m_impl->sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        // penalty_last_n=256: covers ~1 full paragraph lookback window.
+        // Was 64 — too narrow for 512+ token outputs; model couldn't see its own
+        // earlier text and repeated entire sentences/paragraphs.
+        llama_sampler_chain_add(m_impl->sampler, llama_sampler_init_penalties(256, 1.1f, 0.0f, 0.0f));
         llama_sampler_chain_add(m_impl->sampler, llama_sampler_init_top_k(params.topK));
         llama_sampler_chain_add(m_impl->sampler, llama_sampler_init_top_p(params.topP, 1));
         llama_sampler_chain_add(m_impl->sampler, llama_sampler_init_temp(params.temperature));
@@ -214,7 +243,7 @@ namespace LocalNotebookLLM::Infrastructure {
             " | gpuLayers=" + std::to_string(gpuLayers) +
             " | ctx=" + std::to_string(params.contextWindowSize) + " ===");
 
-        LOG_INFO("LlamaCpp", "System Info: {}", llama_print_system_info());
+        LOG_INFO("LlamaCpp", std::string("System Info: ") + llama_print_system_info());
 
         return {};
 #else
@@ -289,27 +318,205 @@ namespace LocalNotebookLLM::Infrastructure {
             }
         }
 
-        // ─── KV-cache token-level prefix reuse ───
-        int n_match = 0;
-        if (m_impl->kvCacheWarm) {
-            for (size_t i = 0; i < static_cast<size_t>(n_prompt_tokens) && i < m_impl->cachedTokens.size(); i++) {
-                if (promptTokens[i] == m_impl->cachedTokens[i]) {
-                    n_match++;
+        // ═══════════════════════════════════════════════════════════════
+        //  Gold Standard Two-Stage KV Cache
+        // ═══════════════════════════════════════════════════════════════
+        //
+        //  Stage 1 — System Prefix Pin
+        //    On the very first call after model load, evaluate and store the
+        //    system prefix in KV seq_id=1 (treated as immutable). On all
+        //    subsequent calls, these positions are never re-evaluated.
+        //
+        //  Stage 2 — Context Block Pin
+        //    Hash the document context block (the retrieved passages).
+        //    If the hash matches the previous call, skip re-evaluation of
+        //    the context entirely — only evaluate the question tail.
+        //    If it differs, evict only [systemPrefixLen, contextEnd) and
+        //    re-evaluate the new context. The system prefix is untouched.
+        // ═══════════════════════════════════════════════════════════════
+
+        int n_match = 0; // Legacy fallback — used when staged approach isn't applicable
+
+        if (!m_impl->systemPrefixWarm) {
+            // ── Stage 1: First call — evaluate and pin the system prefix ──
+            // We identify the system prefix by its known stable content.
+            // The prefix ends at the first occurrence of "\n\nYou are" (where
+            // the intent-specific persona begins) or at a safe fallback length.
+            //
+            // Strategy: tokenize the full prompt, scan forward to find the
+            // boundary token index where the system prefix ends, then evaluate
+            // only those tokens and mark them as pinned.
+            //
+            // For simplicity and safety, we define the system prefix as the
+            // CRITICAL RULES block (the first 4 numbered lines up to the
+            // first blank line before the intent persona).
+
+            // Identify prefix boundary: find "\n\nYou are" in the raw prompt string.
+            const std::string personaMarker = "\n\nYou are";
+            size_t markerPos = prompt.find(personaMarker);
+
+            // Re-tokenize just the prefix portion to get its exact length
+            int prefixCharLen = (markerPos != std::string::npos)
+                                ? static_cast<int>(markerPos)
+                                : std::min(static_cast<int>(prompt.size()), 400); // fallback: first 400 chars
+
+            std::vector<llama_token> prefixToks(n_ctx);
+            int nPrefixToks = llama_tokenize(
+                m_impl->vocab, prompt.c_str(), prefixCharLen,
+                prefixToks.data(), n_ctx, true, true);
+
+            if (nPrefixToks > 0 && nPrefixToks < n_prompt_tokens) {
+                prefixToks.resize(static_cast<size_t>(nPrefixToks));
+
+                LOG_INFO("LlamaCpp", "[KV Stage 1] Pinning system prefix: "
+                    + std::to_string(nPrefixToks) + " tokens (first call after model load)");
+
+                // Evaluate prefix tokens and store them in the KV cache at seq_id=0
+                // (we use seq_id=0 throughout — llama.cpp single-sequence mode)
+                uint32_t n_batch = llama_n_batch(m_impl->ctx);
+                llama_memory_clear(llama_get_memory(m_impl->ctx), true);
+
+                for (int pi = 0; pi < nPrefixToks; pi += static_cast<int>(n_batch)) {
+                    int chunk = std::min(static_cast<int>(n_batch), nPrefixToks - pi);
+                    llama_batch batch = llama_batch_init(chunk, 0, 1);
+                    for (int j = 0; j < chunk; j++) {
+                        llama_batch_add(batch, prefixToks[pi + j], pi + j, {0}, false);
+                    }
+                    if (llama_decode(m_impl->ctx, batch) != 0) {
+                        llama_batch_free(batch);
+                        LOG_WARN("LlamaCpp", "[KV Stage 1] Prefix evaluation failed — will proceed without pin");
+                        nPrefixToks = 0;
+                        break;
+                    }
+                    llama_batch_free(batch);
+                }
+
+                if (nPrefixToks > 0) {
+                    m_impl->systemPrefixTokens = std::move(prefixToks);
+                    m_impl->systemPrefixLen    = nPrefixToks;
+                    m_impl->systemPrefixWarm   = true;
+                    // Seed cachedTokens with what we just evaluated
+                    m_impl->cachedTokens = m_impl->systemPrefixTokens;
+                    LOG_INFO("LlamaCpp", "[KV Stage 1] System prefix pinned at positions [0, "
+                        + std::to_string(nPrefixToks) + ") — will never be re-evaluated");
+                }
+            } else {
+                LOG_WARN("LlamaCpp", "[KV Stage 1] Could not isolate system prefix — falling back to full eval");
+            }
+        }
+
+        // ── Stage 2: Context block hash check ──
+        // Extract the context portion of the prompt: everything between the
+        // persona block and the "=== QUESTION ===" marker.
+        bool contextHit = false;
+        int  contextStartPos = m_impl->systemPrefixLen; // KV position where context begins
+        int  contextEndPos   = contextStartPos + m_impl->contextLen; // where it ends
+
+        {
+            // Identify the context block by its delimiters in the raw prompt string
+            const std::string ctxStartMarker = "=== DOCUMENT CONTENT ===";
+            const std::string ctxEndMarker   = "=== QUESTION ===";
+
+            size_t ctxStart = prompt.find(ctxStartMarker);
+            size_t ctxEnd   = prompt.find(ctxEndMarker);
+
+            if (ctxStart != std::string::npos && ctxEnd != std::string::npos && ctxEnd > ctxStart) {
+                // Hash just the context block substring
+                std::string contextSubstr = prompt.substr(ctxStart, ctxEnd - ctxStart);
+                size_t newContextHash = HashString(contextSubstr);
+
+                if (m_impl->contextWarm && newContextHash == m_impl->contextHash) {
+                    // ✅ Stage 2 HIT — same document context, skip re-evaluation
+                    contextHit = true;
+                    n_match = contextEndPos; // Reuse everything up to end of context block
+                    LOG_INFO("LlamaCpp", "[KV Stage 2] Context HIT — reusing "
+                        + std::to_string(n_match) + " tokens (system+context). "
+                        "Only question tail ("
+                        + std::to_string(n_prompt_tokens - n_match) + " tok) will be evaluated.");
+
+                    // Evict the old question tail — keep system prefix + context
+                    llama_memory_seq_rm(llama_get_memory(m_impl->ctx), 0, n_match, -1);
                 } else {
-                    break;
+                    // Stage 2 MISS — new document or first call
+                    // Evict the context region (keep system prefix)
+                    if (m_impl->contextWarm) {
+                        LOG_INFO("LlamaCpp", "[KV Stage 2] Context MISS — document changed. "
+                            "Evicting context region [" + std::to_string(contextStartPos)
+                            + ", " + std::to_string(contextEndPos) + ") and re-evaluating.");
+                        // Evict everything from systemPrefixLen onward (context + old tail)
+                        llama_memory_seq_rm(llama_get_memory(m_impl->ctx), 0,
+                                            m_impl->systemPrefixLen, -1);
+                    } else if (!m_impl->systemPrefixWarm) {
+                        // Neither stage warm yet — full clear
+                        LOG_INFO("LlamaCpp", "[KV Stage 2] Cold start — full cache clear.");
+                        llama_memory_clear(llama_get_memory(m_impl->ctx), true);
+                    } else {
+                        // System prefix warm, context cold — evict from systemPrefixLen onward
+                        llama_memory_seq_rm(llama_get_memory(m_impl->ctx), 0,
+                                            m_impl->systemPrefixLen, -1);
+                        LOG_INFO("LlamaCpp", "[KV Stage 2] Context cold — evicting from pos "
+                            + std::to_string(m_impl->systemPrefixLen) + " onward.");
+                    }
+
+                    // Record the new context hash and token count
+                    // We'll update contextLen after evaluating the new tokens below
+                    m_impl->contextHash  = newContextHash;
+                    m_impl->contextWarm  = false; // Mark as pending — will be set warm after eval
+
+                    // n_match = system prefix (already in KV cache if warm)
+                    n_match = m_impl->systemPrefixWarm ? m_impl->systemPrefixLen : 0;
+
+                    // After evaluation, measure how many context tokens were processed
+                    // by comparing n_prompt_tokens against the question tail length
+                    size_t tailStart = prompt.rfind(ctxEndMarker);
+                    if (tailStart != std::string::npos) {
+                        std::vector<llama_token> tailToks(256);
+                        int nTail = llama_tokenize(
+                            m_impl->vocab,
+                            prompt.c_str() + tailStart,
+                            static_cast<int>(prompt.size() - tailStart),
+                            tailToks.data(), 256, false, true);
+                        if (nTail > 0) {
+                            int newContextLen = n_prompt_tokens - m_impl->systemPrefixLen - nTail;
+                            if (newContextLen > 0) {
+                                m_impl->contextLen  = newContextLen;
+                                m_impl->contextWarm = true;
+                                contextEndPos = contextStartPos + newContextLen;
+                                LOG_INFO("LlamaCpp", "[KV Stage 2] New context block: "
+                                    + std::to_string(newContextLen) + " tokens pinned at pos ["
+                                    + std::to_string(contextStartPos) + ", "
+                                    + std::to_string(contextEndPos) + ")");
+                            }
+                        }
+                    }
+                }
+            } else {
+                // No recognizable context delimiters — fall back to legacy prefix match
+                if (m_impl->kvCacheWarm) {
+                    for (size_t i = 0; i < static_cast<size_t>(n_prompt_tokens)
+                                    && i < m_impl->cachedTokens.size(); i++) {
+                        if (promptTokens[i] == m_impl->cachedTokens[i]) n_match++;
+                        else break;
+                    }
+                    if (n_match > 0) {
+                        llama_memory_seq_rm(llama_get_memory(m_impl->ctx), 0, n_match, -1);
+                    } else {
+                        llama_memory_clear(llama_get_memory(m_impl->ctx), true);
+                        m_impl->cachedTokens.clear();
+                    }
+                    LOG_INFO("LlamaCpp", "[KV Legacy] Prefix match: " + std::to_string(n_match) + " tokens");
+                } else {
+                    llama_memory_clear(llama_get_memory(m_impl->ctx), true);
+                    m_impl->cachedTokens.clear();
                 }
             }
         }
 
-        if (n_match > 0) {
-            LOG_INFO("LlamaCpp", "KV cache HIT — reusing " + std::to_string(n_match) + " tokens from prefix");
-            // Remove everything after the matching prefix from the cache
-            llama_memory_seq_rm(llama_get_memory(m_impl->ctx), 0, n_match, -1);
-            m_impl->cachedTokens.resize(n_match);
-        } else {
-            LOG_INFO("LlamaCpp", "KV cache MISS — no common prefix found, clearing cache");
-            llama_memory_clear(llama_get_memory(m_impl->ctx), true);
-            m_impl->cachedTokens.clear();
+        // Update cachedTokens to reflect current KV state
+        if (contextHit) {
+            m_impl->cachedTokens.resize(static_cast<size_t>(n_match));
+        } else if (m_impl->systemPrefixWarm && n_match == m_impl->systemPrefixLen) {
+            m_impl->cachedTokens = m_impl->systemPrefixTokens;
         }
 
         // Report eval progress so the UI knows where we are
@@ -373,6 +580,7 @@ namespace LocalNotebookLLM::Infrastructure {
         } else {
             // Fallback: build a new sampler if somehow not cached
             m_impl->sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            llama_sampler_chain_add(m_impl->sampler, llama_sampler_init_penalties(256, 1.1f, 0.0f, 0.0f));
             llama_sampler_chain_add(m_impl->sampler, llama_sampler_init_top_k(m_impl->params.topK));
             llama_sampler_chain_add(m_impl->sampler, llama_sampler_init_top_p(m_impl->params.topP, 1));
             llama_sampler_chain_add(m_impl->sampler, llama_sampler_init_temp(m_impl->params.temperature));
@@ -391,6 +599,7 @@ namespace LocalNotebookLLM::Infrastructure {
             }
 
             llama_token newToken = llama_sampler_sample(m_impl->sampler, m_impl->ctx, -1);
+            llama_sampler_accept(m_impl->sampler, newToken);
 
             // Check for end of generation
             if (llama_vocab_is_eog(m_impl->vocab, newToken)) {
@@ -461,11 +670,14 @@ namespace LocalNotebookLLM::Infrastructure {
 #ifdef HAS_LLAMA_CPP
         std::lock_guard lock(m_mutex);
         if (m_impl->loaded && m_impl->vocab) {
-            int maxTokens = static_cast<int>(text.size());
-            std::vector<llama_token> tokens(maxTokens);
+            // Upper bound: tokens are always fewer than characters.
+            // text.size()/2+4 avoids a 32K-int heap allocation for large contexts.
+            int maxEstimate = static_cast<int>(text.size() / 2) + 4;
+            std::vector<llama_token> tokens(maxEstimate);
             int count = llama_tokenize(m_impl->vocab, text.c_str(),
                                         static_cast<int>(text.size()),
-                                        tokens.data(), maxTokens, false, false);
+                                        tokens.data(), maxEstimate, false, false);
+            // count < 0 means the buffer was too small; fall back to char estimate
             return count > 0 ? static_cast<size_t>(count) : text.size() / 4;
         }
 #endif

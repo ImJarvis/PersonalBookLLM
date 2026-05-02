@@ -4,6 +4,7 @@
 #include "Core/Interfaces/IEmbeddingProvider.h"
 #include "Infrastructure/Search/StructuralNavigator.h"
 #include <memory>
+#include <mutex>
 
 namespace LocalNotebookLLM::Infrastructure {
 
@@ -22,11 +23,36 @@ namespace LocalNotebookLLM::Infrastructure {
         std::vector<Core::HybridSearchResult>
         Search(const std::string& query, const Core::HybridSearchOptions& opts = {}) override;
 
+        /// Invalidate the in-memory embedding cache.
+        /// Call after a document is ingested or removed so the next search reloads
+        /// embeddings from SQLite. Thread-safe.
+        void InvalidateCache();
+
     private:
         std::shared_ptr<Core::IStructuralIndexer>  m_fts5Indexer;
         std::shared_ptr<StructuralNavigator>       m_navigator;
         std::shared_ptr<Core::IEmbeddingProvider>  m_embeddingProvider;
         std::shared_ptr<DatabaseManager>           m_db;
+
+        // ── In-memory embedding cache (M1 fix) ──
+        // Loaded once from SQLite on first semantic search; reused every query.
+        // Reduces Tier-3 from O(N·SQLite) to O(N) over L2/L3-cached memory.
+        struct EmbeddedNode {
+            int64_t             nodeId;
+            int64_t             documentId;
+            Core::NodeType      nodeType;
+            int                 pageNumber;
+            std::string         sectionPath;
+            std::string         content;
+            std::vector<float>  embedding;
+        };
+        mutable std::vector<EmbeddedNode> m_embCache;
+        mutable std::mutex               m_cacheMutex;
+        mutable bool                     m_cacheValid = false;
+
+        /// (Re)load all embedded nodes from SQLite into m_embCache.
+        /// Lazy — called automatically before the first semantic search.
+        void LoadEmbeddingCache() const;
 
         /// Fetch the document's structural skeleton for summation queries:
         /// title + all headings + first paragraph under each heading.

@@ -127,11 +127,20 @@ DocumentService::IngestDocument(const std::filesystem::path &filePath,
   if (progress)
     progress({IngestionProgress::Stage::Indexing, 0.6, "Indexing content..."});
 
-  auto indexResult = m_impl->indexer->IndexDocument(meta.id, tree);
-  if (!indexResult) {
-    LOG_ERROR("DocService", "Indexing failed: " + indexResult.error().message);
-    m_impl->repository->Remove(meta.id);
-    return std::unexpected("Indexing failed: " + indexResult.error().message);
+  // SAFETY: wrap in try/catch so that exceptions thrown inside IndexDocument
+  // (e.g. sqlite3_prepare_v2 throwing std::runtime_error) always trigger
+  // a metadata rollback — not just the std::unexpected path.
+  try {
+    auto indexResult = m_impl->indexer->IndexDocument(meta.id, tree);
+    if (!indexResult) {
+      LOG_ERROR("DocService", "Indexing failed: " + indexResult.error().message);
+      m_impl->repository->Remove(meta.id);
+      return std::unexpected("Indexing failed: " + indexResult.error().message);
+    }
+  } catch (const std::exception& e) {
+    LOG_ERROR("DocService", std::string("Indexing threw exception: ") + e.what());
+    m_impl->repository->Remove(meta.id); // Roll back orphaned metadata row
+    return std::unexpected(std::string("Indexing exception: ") + e.what());
   }
 
   if (progress)

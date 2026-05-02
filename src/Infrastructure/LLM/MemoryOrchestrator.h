@@ -31,6 +31,11 @@ namespace LocalNotebookLLM::Infrastructure {
         void SetReasonerConfig(ModelConfig config);
         void SetEmbeddingModelPath(const std::filesystem::path& path);
 
+        /// Prevent the Orchestrator from evicting the embedding model during
+        /// active document ingestion. Set true before GenerateEmbeddingsBackground,
+        /// false after it completes to restore normal eviction behaviour.
+        void SetProtectEmbedding(bool protect);
+
         [[nodiscard]]
         std::expected<void, std::string>
         RequestModel(Core::ModelRole role) override;
@@ -38,7 +43,6 @@ namespace LocalNotebookLLM::Infrastructure {
         void ReleaseModel(Core::ModelRole role) override;
 
         [[nodiscard]] Core::MemorySnapshot GetSnapshot() const override;
-        [[nodiscard]] bool CanLoad(Core::ModelRole role) const override;
         void SetMemoryBudget(size_t maxModelMemoryMB) override;
         [[nodiscard]] Core::GPUInfo DetectGPU() const override;
 
@@ -51,13 +55,17 @@ namespace LocalNotebookLLM::Infrastructure {
         ModelConfig m_reasonerConfig;
         std::filesystem::path m_embeddingModelPath;
 
-        size_t m_memoryBudgetMB = 8192;  // Default 8 GB budget for models
+        size_t m_memoryBudgetMB  = 8192;  // Default 8 GB budget for models
+        bool   m_protectEmbedding = false; // When true, Reasoner load will NOT evict embedding
         mutable std::mutex m_mutex;
 
         /// Get available system RAM in MB.
         [[nodiscard]] static size_t GetAvailableSystemRAM();
         /// Get total system RAM in MB.
         [[nodiscard]] static size_t GetTotalSystemRAM();
+        /// Check if a model role can be loaded within current memory budget.
+        /// IMPORTANT: Must be called while holding m_mutex.
+        [[nodiscard]] bool CanLoad(Core::ModelRole role) const;
     };
 
 } // namespace LocalNotebookLLM::Infrastructure

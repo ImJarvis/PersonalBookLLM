@@ -26,6 +26,53 @@ namespace LocalNotebookLLM::Infrastructure {
         , m_db(std::move(db))
     {}
 
+    // ── M1: In-memory embedding cache ──
+
+    void HybridSearchEngine::InvalidateCache() {
+        std::lock_guard lock(m_cacheMutex);
+        m_cacheValid = false;
+        m_embCache.clear();
+        LOG_INFO("Search", "Embedding cache invalidated");
+    }
+
+    void HybridSearchEngine::LoadEmbeddingCache() const {
+        // Caller must NOT hold m_cacheMutex when calling this.
+        if (!m_db) return;
+
+        std::lock_guard lock(m_cacheMutex);
+        if (m_cacheValid) return; // Double-checked locking
+
+        LOG_INFO("Search", "Loading embedding cache from SQLite...");
+        m_embCache.clear();
+
+        auto stmt = m_db->Prepare(R"(
+            SELECT id, document_id, node_type, page_number, section_path, content, embedding
+            FROM document_nodes
+            WHERE embedding IS NOT NULL
+        )");
+
+        while (stmt.Step()) {
+            int bytes = sqlite3_column_bytes(stmt.GetHandle(), 6);
+            if (bytes <= 0 || bytes % sizeof(float) != 0) continue;
+
+            EmbeddedNode node;
+            node.nodeId      = stmt.GetInt64(0);
+            node.documentId  = stmt.GetInt64(1);
+            node.nodeType    = Core::StringToNodeType(stmt.GetString(2));
+            node.pageNumber  = stmt.GetInt(3);
+            node.sectionPath = stmt.GetString(4);
+            node.content     = stmt.GetString(5);
+
+            const float* blob = reinterpret_cast<const float*>(sqlite3_column_blob(stmt.GetHandle(), 6));
+            size_t dim = bytes / sizeof(float);
+            node.embedding.assign(blob, blob + dim);
+            m_embCache.push_back(std::move(node));
+        }
+
+        m_cacheValid = true;
+        LOG_INFO("Search", "Embedding cache loaded: " + std::to_string(m_embCache.size()) + " nodes");
+    }
+
     std::vector<Core::HybridSearchResult>
     HybridSearchEngine::Search(const std::string& query, const Core::HybridSearchOptions& opts) {
         LOG_INFO("Search", "Search() query: \"" + query + "\" topK=" + std::to_string(opts.topK));
@@ -78,7 +125,7 @@ namespace LocalNotebookLLM::Infrastructure {
         auto structuralResults = m_navigator->Navigate(query, opts.topK * 2);
         LOG_INFO("Search", "Tier 2 (Structural): " + std::to_string(structuralResults.size()) + " results");
 
-        // ── TIER 3: Semantic Embedding Matching ──
+        // ── TIER 3: Semantic Embedding Matching (M1: in-memory cache) ──
         std::vector<Core::HybridSearchResult> semanticResults;
         if (opts.enableEmbeddingFallback && m_embeddingProvider && m_embeddingProvider->IsLoaded() && m_db) {
             LOG_INFO("Search", "Tier 3 (Semantic): Embedding query...");
@@ -86,68 +133,51 @@ namespace LocalNotebookLLM::Infrastructure {
             if (queryEmbResult) {
                 const std::vector<float>& queryVec = *queryEmbResult;
 
-                std::string sql = R"(
-                    SELECT id, document_id, node_type, page_number, section_path, content, embedding
-                    FROM document_nodes
-                    WHERE embedding IS NOT NULL
-                )";
-                if (opts.documentIdFilter >= 0) {
-                    sql += " AND document_id = " + std::to_string(opts.documentIdFilter);
-                }
+                // Lazy-load the cache (no-op if already valid)
+                LoadEmbeddingCache();
 
-                auto stmt = m_db->Prepare(sql);
-                
-                struct ScoredSemantic {
-                    Core::SearchResult res;
-                    float score;
-                };
+                struct ScoredSemantic { const EmbeddedNode* node; float score; };
                 std::vector<ScoredSemantic> candidates;
 
-                while (stmt.Step()) {
-                    int bytes = sqlite3_column_bytes(stmt.GetHandle(), 6);
-                    if (bytes > 0 && bytes % sizeof(float) == 0) {
-                        const float* blob = reinterpret_cast<const float*>(sqlite3_column_blob(stmt.GetHandle(), 6));
-                        size_t dim = bytes / sizeof(float);
-                        
-                        if (dim == queryVec.size()) {
-                            float score = 0.0f;
-                            for (size_t i = 0; i < dim; ++i) {
-                                score += queryVec[i] * blob[i];
-                            }
-                            
-                            if (score > 0.3f) {  // Lower threshold for RRF — let fusion decide
-                                Core::SearchResult r;
-                                r.nodeId = stmt.GetInt64(0);
-                                r.documentId = stmt.GetInt64(1);
-                                r.nodeType = Core::StringToNodeType(stmt.GetString(2));
-                                r.pageNumber = stmt.GetInt(3);
-                                r.sectionPath = stmt.GetString(4);
-                                r.content = stmt.GetString(5);
-                                r.bm25Score = score;
-                                candidates.push_back({std::move(r), score});
-                            }
-                        }
+                {
+                    std::lock_guard lock(m_cacheMutex);
+                    candidates.reserve(m_embCache.size());
+                    for (const auto& node : m_embCache) {
+                        // Filter by document if requested
+                        if (opts.documentIdFilter >= 0 && node.documentId != opts.documentIdFilter)
+                            continue;
+                        if (node.embedding.size() != queryVec.size())
+                            continue;
+
+                        // Dot product (both vectors are L2-normalised, so this = cosine similarity)
+                        float score = 0.0f;
+                        for (size_t i = 0; i < queryVec.size(); ++i)
+                            score += queryVec[i] * node.embedding[i];
+
+                        if (score > 0.3f)
+                            candidates.push_back({&node, score});
                     }
                 }
-                
-                std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
-                    return a.score > b.score;
-                });
-                
+
+                std::sort(candidates.begin(), candidates.end(),
+                    [](const auto& a, const auto& b) { return a.score > b.score; });
+
                 for (size_t i = 0; i < candidates.size() && i < static_cast<size_t>(opts.topK * 2); ++i) {
+                    const auto& n = *candidates[i].node;
                     Core::HybridSearchResult hr;
-                    hr.nodeId = candidates[i].res.nodeId;
-                    hr.documentId = candidates[i].res.documentId;
-                    hr.nodeType = candidates[i].res.nodeType;
-                    hr.pageNumber = candidates[i].res.pageNumber;
-                    hr.sectionPath = candidates[i].res.sectionPath;
-                    hr.content = candidates[i].res.content;
-                    hr.bm25Score = candidates[i].score;
+                    hr.nodeId          = n.nodeId;
+                    hr.documentId      = n.documentId;
+                    hr.nodeType        = n.nodeType;
+                    hr.pageNumber      = n.pageNumber;
+                    hr.sectionPath     = n.sectionPath;
+                    hr.content         = n.content;
+                    hr.bm25Score       = candidates[i].score;
                     hr.confidenceScore = candidates[i].score;
-                    hr.resolvedTier = Core::SearchTier::Embedding;
+                    hr.resolvedTier    = Core::SearchTier::Embedding;
                     semanticResults.push_back(std::move(hr));
                 }
-                LOG_INFO("Search", "Tier 3 (Semantic): " + std::to_string(semanticResults.size()) + " matches > 0.3");
+                LOG_INFO("Search", "Tier 3 (Semantic): " + std::to_string(semanticResults.size()) +
+                         " matches >0.3 (from cache of " + std::to_string(m_embCache.size()) + " nodes)");
             }
         }
 
@@ -198,36 +228,8 @@ namespace LocalNotebookLLM::Infrastructure {
         return hybrid;
     }
 
-    std::vector<Core::HybridSearchResult>
-    HybridSearchEngine::MergeAndDeduplicate(
-        const std::vector<Core::HybridSearchResult>& a,
-        const std::vector<Core::HybridSearchResult>& b)
-    {
-        std::vector<Core::HybridSearchResult> merged;
-        std::set<int64_t> seenIds;
-
-        // Add all from 'a' first
-        for (const auto& r : a) {
-            if (seenIds.insert(r.nodeId).second) {
-                merged.push_back(r);
-            }
-        }
-
-        // Add from 'b' only if not already present (or if higher score)
-        for (const auto& r : b) {
-            if (seenIds.insert(r.nodeId).second) {
-                merged.push_back(r);
-            }
-        }
-
-        // Sort by confidence score descending
-        std::sort(merged.begin(), merged.end(),
-                  [](const auto& x, const auto& y) {
-                      return x.confidenceScore > y.confidenceScore;
-                  });
-
-        return merged;
-    }
+    // NOTE: MergeAndDeduplicate() was removed — superseded by FuseWithRRF() above.
+    // RRF fusion handles deduplication implicitly via the nodeId keyed score map.
 
     std::vector<Core::HybridSearchResult>
     HybridSearchEngine::TakeTop(std::vector<Core::HybridSearchResult>& results, int n) {
@@ -513,16 +515,16 @@ namespace LocalNotebookLLM::Infrastructure {
             ? " AND document_id = " + std::to_string(documentIdFilter)
             : "";
 
-        // Find headings containing the chapter number
-        // We look for "chapter N", "N.", or just the number in the heading text
+        // H3: Use bound parameters for chNum — prevents injection if regex match
+        //     ever returns unexpected content (e.g. via Unicode normalization).
         std::string headingSql = R"(
             SELECT id, document_id, node_type, page_number, section_path, content
             FROM document_nodes
             WHERE node_type IN ('title', 'h1', 'h2', 'h3')
             AND (
-                LOWER(content) LIKE '%chapter )" + chNum + R"(%'
-                OR LOWER(content) LIKE '%)" + chNum + R"(.%'
-                OR LOWER(content) LIKE '% )" + chNum + R"( %'
+                LOWER(content) LIKE ?
+                OR LOWER(content) LIKE ?
+                OR LOWER(content) LIKE ?
             )
         )" + docFilter + R"(
             ORDER BY document_id, sort_order
@@ -530,6 +532,9 @@ namespace LocalNotebookLLM::Infrastructure {
         )";
 
         auto headingStmt = m_db->Prepare(headingSql);
+        headingStmt.Bind(1, "%chapter " + chNum + "%");
+        headingStmt.Bind(2, "%" + chNum + ".%");
+        headingStmt.Bind(3, "% " + chNum + " %");
         std::vector<Core::HybridSearchResult> results;
 
         while (headingStmt.Step()) {

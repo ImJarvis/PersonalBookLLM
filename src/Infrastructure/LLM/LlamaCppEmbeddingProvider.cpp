@@ -1,27 +1,13 @@
 #include "Infrastructure/LLM/LlamaCppEmbeddingProvider.h"
 #include "Core/Log.h"
+#include "Infrastructure/LLM/GPUDetector.h"
 
 #ifdef HAS_LLAMA_CPP
 #include <llama.h>
 #endif
 
-// Polyfill for batching if needed
 #ifdef HAS_LLAMA_CPP
-static inline void llama_batch_add(
-    struct llama_batch & batch,
-    llama_token   id,
-    llama_pos   pos,
-    const std::vector<llama_seq_id> & seq_ids,
-    bool   logits) {
-    batch.token   [batch.n_tokens] = id;
-    batch.pos     [batch.n_tokens] = pos;
-    batch.n_seq_id[batch.n_tokens] = static_cast<int32_t>(seq_ids.size());
-    for (size_t i = 0; i < seq_ids.size(); ++i) {
-        batch.seq_id[batch.n_tokens][i] = seq_ids[i];
-    }
-    batch.logits  [batch.n_tokens] = logits ? 1 : 0;
-    batch.n_tokens++;
-}
+#include "Infrastructure/LLM/LlamaInternalUtils.h"  // H5: shared polyfill (llama_batch_add)
 #endif
 
 namespace LocalNotebookLLM::Infrastructure {
@@ -63,10 +49,17 @@ namespace LocalNotebookLLM::Infrastructure {
         }
 
         auto mparams = llama_model_default_params();
-        // Auto-detect GPU: try full offload if GPU available, otherwise CPU-only.
-        // On CPU-only 8GB machines, n_gpu_layers=99 silently falls back to 0
-        // but wastes the GPU detection attempt.
-        mparams.n_gpu_layers = 99; // llama.cpp safely clamps to 0 when no GPU present
+        
+        // Auto-detect GPU using the same logic as the main provider
+        int gpuLayers = 99;
+        size_t fileSizeMB = std::filesystem::file_size(modelPath) / (1024 * 1024);
+        auto gpu = GPUDetector::Detect();
+        if (gpu.hasDedicatedGPU) {
+            gpuLayers = GPUDetector::RecommendGPULayers(fileSizeMB, gpu.freeVramMB);
+        } else {
+            gpuLayers = 0; // CRITICAL: Prevent low-VRAM iGPUs from crashing during init
+        }
+        mparams.n_gpu_layers = gpuLayers;
 
         m_impl->model = llama_model_load_from_file(modelPath.string().c_str(), mparams);
         if (!m_impl->model) {
@@ -76,10 +69,12 @@ namespace LocalNotebookLLM::Infrastructure {
         m_impl->vocab = llama_model_get_vocab(m_impl->model);
 
         auto cparams = llama_context_default_params();
-        cparams.n_ctx = 8192; // Max sum of batch tokens allowed
-        cparams.n_batch = 8192; // Match batch evaluation block max to ctx
-        cparams.n_ubatch = 8192; // Match physical batch block max to prevent decode failures
-        cparams.n_seq_max = 128; // CRITICAL: Allow up to 128 simultaneous sequence IDs in the KV cache
+        cparams.n_ctx = 2048; // Nomic native train ctx; avoids RoPE scaling issues
+        cparams.n_batch = 512; // Prevent compute_buffer OOM
+        cparams.n_ubatch = 512;
+        cparams.n_seq_max = 32;  // Right-sized for typical document batches (10–30 chunks).
+                                  // Was 128 — allocated 4x more KV memory than needed, slowing
+                                  // init and increasing RAM pressure during embedding.
         // Thread count: balance between throughput and OS responsiveness.
         // For hyper-threaded CPUs > 4 logical cores, use physical cores (logical / 2).
         // For CPUs <= 4 logical cores, use logical cores - 1 (leave 1 for OS).

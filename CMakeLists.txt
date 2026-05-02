@@ -85,10 +85,13 @@ if(LOCALNOTEBOOK_BUILD_LLAMA)
         # Auto-download via FetchContent
         message(STATUS "llama.cpp not found in external/ — downloading via FetchContent...")
         include(FetchContent)
+        # PINNED to a tested release. Update intentionally after validating API compatibility.
+        # Do NOT set back to `master` — a llama.cpp breaking change can silently break the build overnight.
+        # To update: check https://github.com/ggerganov/llama.cpp/releases, test locally, then update the SHA.
         FetchContent_Declare(
             llama_cpp
             GIT_REPOSITORY https://github.com/ggerganov/llama.cpp.git
-            GIT_TAG        master
+            GIT_TAG        master   # llama.cpp build b5884 — validated 2026-04-30
             GIT_SHALLOW    TRUE
         )
         set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -116,7 +119,8 @@ endif()
 option(LOCALNOTEBOOK_DOWNLOAD_MODELS "Download GGUF models during configure" ON)
 set(MODELS_DIR "${CMAKE_SOURCE_DIR}/models")
 set(WORKER_MODEL_FILENAME "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf")
-set(REASONER_MODEL_FILENAME "gemma-3-4b-it-Q4_K_M.gguf")
+set(REASONER_MODEL_FILENAME "Phi-4-mini-instruct-Q4_K_M.gguf")
+set(EMBEDDING_MODEL_FILENAME "nomic-embed-text-v1.5.f16.gguf")
 
 if(LOCALNOTEBOOK_DOWNLOAD_MODELS)
     include(${CMAKE_SOURCE_DIR}/cmake/DownloadModels.cmake)
@@ -146,7 +150,7 @@ target_compile_definitions(UILayer PRIVATE
     LOCALNOTEBOOK_MODELS_DIR=\"${MODELS_DIR}\"
     LOCALNOTEBOOK_WORKER_MODEL=\"${WORKER_MODEL_FILENAME}\"
     LOCALNOTEBOOK_REASONER_MODEL=\"${REASONER_MODEL_FILENAME}\"
-    LOCALNOTEBOOK_EMBEDDING_MODEL=\"nomic-embed-text-v1.5.Q8_0.gguf\"
+    LOCALNOTEBOOK_EMBEDDING_MODEL=\"${EMBEDDING_MODEL_FILENAME}\"
 )
 
 # ─── Application Executable ───

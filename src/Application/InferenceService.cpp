@@ -126,10 +126,26 @@ namespace LocalNotebookLLM::Application {
         if (progress) progress({AnswerProgress::Stage::Generating, ""});
         std::string prompt = BuildPrompt(ctx, query);
 
-        // Use a larger generation budget for broad synthesis queries
-        auto intent = Application::QueryAnalyzer::DetectIntent(query);
-        int maxGenTokens = (intent == Application::QueryIntent::Summation ||
-                            intent == Application::QueryIntent::ChapterSummary) ? 2048 : 1024;
+        // Compute a safe generation budget to prevent context overflow.
+        // n_ctx - prompt_tokens - 64 (headroom) = tokens actually available for generation.
+        // Without this, a 3000-token Summation prompt + 2048 budget overflows 4096 ctx,
+        // the overflow guard clamps to ~900 tokens, then the model loops endlessly.
+        auto   intent       = Application::QueryAnalyzer::DetectIntent(query);
+        size_t ctxWindow    = contextWindow;  // Already fetched above for Assemble()
+        size_t promptEst    = m_impl->llm->EstimateTokenCount(prompt);
+        int    safeGenBudget = static_cast<int>(ctxWindow)
+                             - static_cast<int>(promptEst) - 64;  // 64-token headroom
+        safeGenBudget = std::max(128, safeGenBudget);
+
+        int maxGenTokens = std::min(safeGenBudget,
+            (intent == Application::QueryIntent::Summation ||
+             intent == Application::QueryIntent::ChapterSummary) ? 1024 : 512);
+
+        LOG_INFO("Inference", "Generation budget: ctx=" + std::to_string(ctxWindow)
+            + " promptEst=" + std::to_string(promptEst)
+            + " safe=" + std::to_string(safeGenBudget)
+            + " maxGenTokens=" + std::to_string(maxGenTokens));
+
         auto genResult = m_impl->llm->GenerateStreaming(prompt, maxGenTokens, tokenCallback);
 
         if (!genResult) {
